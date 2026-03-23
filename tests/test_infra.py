@@ -40,6 +40,7 @@ def test_compose_env_names_align_with_local_settings_contract() -> None:
     ]
     assert env["VERTEXAI_SERVICE_ACCOUNT_FILE"] == "./config/secrets/vertex_service_account.json"
     assert env["GOOGLE_APPLICATION_CREDENTIALS"] == "./config/secrets/vertex_service_account.json"
+    assert env["VERTEXAI_LOCATION"] == "${VERTEXAI_LOCATION:-global}"
     assert env["REDIS_URL"] == "redis://redis:6379/0"
     assert env["ARTIFACT_STORE_URL"] == "file:///data"
     assert env["OPENHANDS_AGENT_SERVER_BASE_URL"] == "http://127.0.0.1:8000"

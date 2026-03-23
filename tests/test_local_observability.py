@@ -21,7 +21,7 @@ def _settings(root: Path) -> LocalEnvironmentSettings:
         "\n".join(
             [
                 "VERTEXAI_PROJECT=demo-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "POSTGRES_URL=postgresql://user@host/db",
                 "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
                 "REDIS_URL=redis://127.0.0.1:6379/0",

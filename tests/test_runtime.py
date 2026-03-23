@@ -94,6 +94,17 @@ def test_repeated_failures_escalate_route_profile() -> None:
     assert len(router.audit_log.records) == 2
 
 
+def test_router_can_force_named_profile_override() -> None:
+    router = VertexModelRouter(_vertex_config(), preferred_profile="economy")
+    task = _task(role="manager")
+    attempt = _attempt(task)
+
+    route = router.select_route(task=task, attempt=attempt, hints=["planning"])
+
+    assert route.model_name == "vertex_ai/gemini-flash"
+    assert "forced_profile=economy" in route.route_reason
+
+
 def test_compiler_builds_worker_config_with_vertex_env_and_no_login(tmp_path: Path) -> None:
     task = _task()
     attempt = _attempt(task)
@@ -315,7 +326,7 @@ def test_openhands_vertex_reasoning_defaults_to_none() -> None:
     request = build_openhands_conversation_request(
         {
             "provider_name": "VertexAI",
-            "model_name": "gemini-2.5-flash",
+            "model_name": "gemini-3-flash-preview",
             "task_id": "task-1",
             "task_attempt_id": "attempt-1",
             "task_role": "manager",
@@ -328,6 +339,7 @@ def test_openhands_vertex_reasoning_defaults_to_none() -> None:
     )
 
     assert request["agent"]["llm"]["reasoning_effort"] == "none"
+    assert request["agent"]["llm"]["model"] == "vertex_ai/gemini-3-flash-preview"
 
 
 def test_openhands_reasoning_override_is_respected() -> None:

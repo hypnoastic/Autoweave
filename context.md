@@ -308,7 +308,78 @@ Verified live payload after the fix from the new repo-root run:
 - the repo-root live example is not yet achieving a clean successful completion; the current live run remains sensitive to external Vertex runtime behavior, including observed `429 RESOURCE_EXHAUSTED` pressure in the OpenHands container logs
 - the manager task still enters a very minimal isolated workspace, so the live example does not yet give the worker a richer seeded repo snapshot or narrower startup instructions
 - the direct LiteLLM empty-turn reproduction was not perfectly deterministic across repeated reruns, so the strongest evidence remains the captured failing replay plus the observed elimination of the loop after the provider-specific reasoning default changed
+
+## Gemini 3 migration/debugging plan: 2026-03-23
+
+- audit the current Gemini 2.5 model path end to end across AutoWeave config, router output, OpenHands request compilation, and live Vertex endpoint behavior
+- verify valid current Gemini 3 family model IDs from official Vertex sources before changing defaults
+- add a controlled config surface so the active local/dev Vertex profile can be switched between Gemini 2.5 fallback and Gemini 3 candidates without hardcoded hacks
+- try at least one Gemini 3 Flash path first, then `gemini-3.1-pro-preview` if the stack supports it, and compare auth, empty-response behavior, rate-limit behavior, and OpenHands stability
+- update tests and docs so deprecated Gemini 3 IDs are not the default and the best working profile is clearly recorded
 - native runtime validation and packaged fresh-install validation that exercise the real local/remote environment mix without hardcoding secrets
+
+## Gemini 3 migration/debugging result: 2026-03-23
+
+### Audit findings
+
+- The runtime source of truth for live Vertex routing is `configs/runtime/vertex.yaml`; `configs/routing/model_profiles.yaml` mirrors the same profile family for routing/diagnostics, but the OpenHands worker path ultimately follows the runtime config plus the local environment seen by the agent-server container.
+- AutoWeave already normalized worker model strings correctly to `vertex_ai/<model>` in `autoweave/workers/runtime.py`, so the remaining Gemini 2.5 instability was not caused by provider-name formatting.
+- The main Gemini 2.5 defaults and assumptions were spread across `configs/runtime/vertex.yaml`, `configs/routing/model_profiles.yaml`, `apps/cli/bootstrap.py`, `.env.example`, local settings defaults, and a cluster of runtime/CLI tests.
+- The direct provider stack and the OpenHands stack were both capable of using Gemini 3, but only when Vertex routing used the `global` endpoint rather than the old local default of `us-central1`.
+
+### Model and endpoint results
+
+- Direct LiteLLM/Vertex smoke tests:
+  - `vertex_ai/gemini-2.5-flash` worked against `us-central1`
+  - `vertex_ai/gemini-3-flash-preview` failed against `us-central1` and succeeded against `global`
+  - `vertex_ai/gemini-3.1-pro-preview` succeeded against `global`
+- Direct streaming and native-tool tests also succeeded against `global` for:
+  - `vertex_ai/gemini-3-flash-preview`
+  - `vertex_ai/gemini-3.1-pro-preview`
+- Live AutoWeave/OpenHands validation succeeded with planner routing on `vertex_ai/gemini-3.1-pro-preview` once the local runtime and agent-server container were aligned to `VERTEXAI_LOCATION=global`.
+
+### Root cause
+
+- The remaining Gemini 3 failure was not IAM and not bad `vertex_ai/<model>` normalization.
+- In the current OpenHands/LiteLLM path, per-conversation secrets were not sufficient to change the Vertex location used by the worker runtime. The local OpenHands agent-server kept using its own process environment and continued calling `us-central1`.
+- That mismatch caused Gemini 3 requests to hit the wrong Vertex endpoint and fail with model-not-found behavior even when the same model worked directly through LiteLLM against `global`.
+
+### What changed in this pass
+
+- Gemini 3 is now the default local/dev profile family:
+  - planner: `gemini-3.1-pro-preview`
+  - balanced: `gemini-3-flash-preview`
+  - fast: `gemini-3-flash-preview`
+- Gemini 2.5 remains available as explicit legacy fallback profiles:
+  - `legacy_planner = gemini-2.5-pro`
+  - `legacy_balanced = gemini-2.5-pro`
+  - `legacy_fast = gemini-2.5-flash`
+- `AUTOWEAVE_VERTEX_PROFILE_OVERRIDE` is now the clean config switch for forcing a specific profile without editing code.
+- Local/dev defaults were aligned to `VERTEXAI_LOCATION=global` in the settings layer, Docker Compose env, sample bootstrap output, and test fixtures so the OpenHands agent-server and AutoWeave runtime agree on Vertex routing.
+- Docs and tests were updated so deprecated `gemini-3-pro-preview` is not the default anywhere in the repository.
+
+### Validated working state
+
+- `python3 -m compileall autoweave apps tests`
+- `python3 -m pytest tests/test_infra.py tests/test_settings.py tests/test_local_runtime.py tests/test_packaging.py tests/test_storage_service_wiring.py tests/test_local_observability.py -q`
+- `.venv/bin/python -m apps.cli.main doctor --root .`
+- direct LiteLLM smoke against `vertex_ai/gemini-3-flash-preview` on `global`
+- `.venv/bin/python -m apps.cli.main run-example --root . --dispatch`
+- `.venv/bin/python -m pytest -q`
+
+The repo-root live example now completes through the real OpenHands path with:
+
+- routed planner model `gemini-3.1-pro-preview`
+- task state `completed`
+- attempt state `succeeded`
+- workflow still running afterward because the example only dispatches the current runnable slice
+- emitted stream events and a published artifact ID
+
+### Remaining limitations
+
+- Gemini 3 materially improved the runtime path, but preview-model capacity behavior can still vary; `gemini-3.1-pro-preview` may still see quota or rate-limit pressure under different workloads.
+- `gemini-3-flash-preview` is the lower-risk direct smoke path; the planner default remains `gemini-3.1-pro-preview` because it produced the strongest successful live AutoWeave result in this pass.
+- Earlier sections in this file that mention IAM or `us-central1` Gemini 2.5 failures are historical notes; this section is the current source of truth for the Gemini migration outcome.
 
 ## Final durable-runtime repair status: 2026-03-20
 
@@ -373,8 +444,9 @@ This section supersedes the earlier repair-pass notes that still described Docke
 - `/tmp/autoweave-online-venv/bin/autoweave doctor --root /tmp/autoweave-online-project`
 - `/tmp/autoweave-online-venv/bin/autoweave run-example --root /tmp/autoweave-online-project --dispatch`
 
-### Current blocker and remaining risk
+### Current state and remaining risk
 
-- The library and local Dockerized runtime now work through the real OpenHands execution path, but successful worker completion is still blocked by the current Vertex service-account IAM on the configured publisher model.
-- The observed live failure is `403 PERMISSION_DENIED` for `aiplatform.endpoints.predict` against `projects/ergon-488918/locations/us-central1/publishers/google/models/gemini-2.5-flash`.
-- This is now an external credentials/IAM issue rather than a local AutoWeave runtime or packaging issue.
+- The IAM and wrong-endpoint blockers are resolved for the local runtime path.
+- The current validated local/dev default is Gemini 3 on the Vertex `global` endpoint, with Gemini 2.5 retained as explicit fallback profiles.
+- Repo-root direct smoke, OpenHands runtime validation, and `run-example --dispatch` now succeed through the live local Docker stack.
+- Remaining risk is external capacity variability on preview Gemini 3 models rather than a known AutoWeave provider-routing bug.

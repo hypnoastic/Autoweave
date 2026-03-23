@@ -1,6 +1,7 @@
 name: autoweave
 
 x-autoweave-common-env: &autoweave-common-env
+  VERTEXAI_LOCATION: ${VERTEXAI_LOCATION:-global}
   VERTEXAI_SERVICE_ACCOUNT_FILE: ./config/secrets/vertex_service_account.json
   GOOGLE_APPLICATION_CREDENTIALS: ./config/secrets/vertex_service_account.json
   REDIS_URL: redis://redis:6379/0

@@ -15,7 +15,7 @@ AutoWeave is a terminal-first orchestration library. It owns canonical workflow 
 Use `.env.local` for local development. Required values:
 
 - `VERTEXAI_PROJECT`
-- `VERTEXAI_LOCATION`
+- `VERTEXAI_LOCATION=global` for the Gemini 3 local/dev path
 - `VERTEXAI_SERVICE_ACCOUNT_FILE=./config/secrets/vertex_service_account.json`
 - `GOOGLE_APPLICATION_CREDENTIALS=./config/secrets/vertex_service_account.json`
 - `POSTGRES_URL`
@@ -26,8 +26,11 @@ Use `.env.local` for local development. Required values:
 - `ARTIFACT_STORE_URL=file://./var/artifacts`
 - `OPENHANDS_AGENT_SERVER_BASE_URL=http://127.0.0.1:8000`
 - `OPENHANDS_AGENT_SERVER_API_KEY` if required by your Agent Server
+- `AUTOWEAVE_VERTEX_PROFILE_OVERRIDE` to force a specific profile such as `legacy_fast`
 
 Copy the Vertex service-account JSON to `config/secrets/vertex_service_account.json`. Keep `.env.local` and `config/secrets/` out of git.
+
+The checked-in Gemini 3 local/dev profile assumes the OpenHands Agent Server runs with `VERTEXAI_LOCATION=global`. OpenHands currently uses its own process environment for Vertex routing, not the per-conversation AutoWeave launch payload, so restart `docker compose up -d openhands-agent-server autoweave-runtime` after changing Vertex location values.
 
 ## Start local infrastructure
 

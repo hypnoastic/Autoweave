@@ -240,9 +240,12 @@ def render_workflow_yaml() -> str:
 def render_model_profiles_yaml() -> str:
     profiles: dict[str, Any] = {
         "profiles": [
-            {"name": "balanced", "model": "gemini-2.5-pro", "budget_class": "balanced"},
-            {"name": "planner", "model": "gemini-2.5-pro", "budget_class": "high"},
-            {"name": "fast", "model": "gemini-2.5-flash", "budget_class": "low"},
+            {"name": "balanced", "model": "gemini-3-flash-preview", "budget_class": "balanced"},
+            {"name": "planner", "model": "gemini-3.1-pro-preview", "budget_class": "high"},
+            {"name": "fast", "model": "gemini-3-flash-preview", "budget_class": "low"},
+            {"name": "legacy_balanced", "model": "gemini-2.5-pro", "budget_class": "balanced"},
+            {"name": "legacy_planner", "model": "gemini-2.5-pro", "budget_class": "high"},
+            {"name": "legacy_fast", "model": "gemini-2.5-flash", "budget_class": "low"},
         ]
     }
     return yaml.safe_dump(profiles, sort_keys=False)
@@ -275,14 +278,24 @@ def render_runtime_files() -> dict[Path, str]:
             {
                 "provider_name": "VertexAI",
                 "profile_definitions": [
-                    {"name": "planner", "model": "gemini-2.5-pro", "timeout_seconds": 1800, "max_retries": 2},
-                    {"name": "balanced", "model": "gemini-2.5-pro", "timeout_seconds": 1800, "max_retries": 2},
-                    {"name": "fast", "model": "gemini-2.5-flash", "timeout_seconds": 900, "max_retries": 1},
+                    {"name": "planner", "model": "gemini-3.1-pro-preview", "timeout_seconds": 1800, "max_retries": 2},
+                    {"name": "balanced", "model": "gemini-3-flash-preview", "timeout_seconds": 1200, "max_retries": 2},
+                    {"name": "fast", "model": "gemini-3-flash-preview", "timeout_seconds": 900, "max_retries": 1},
+                    {"name": "legacy_planner", "model": "gemini-2.5-pro", "timeout_seconds": 1800, "max_retries": 2},
+                    {"name": "legacy_balanced", "model": "gemini-2.5-pro", "timeout_seconds": 1800, "max_retries": 2},
+                    {"name": "legacy_fast", "model": "gemini-2.5-flash", "timeout_seconds": 900, "max_retries": 1},
                 ],
-                "fallback_order": ["fast", "balanced", "planner"],
+                "fallback_order": ["fast", "balanced", "planner", "legacy_planner", "legacy_balanced", "legacy_fast"],
                 "timeout_policy": {"dispatch_seconds": 10},
                 "retry_policy": {"escalate_after_failures": 2},
-                "token_cost_budgets": {"planner": 120000, "balanced": 80000, "fast": 20000},
+                "token_cost_budgets": {
+                    "planner": 120000,
+                    "balanced": 80000,
+                    "fast": 20000,
+                    "legacy_planner": 120000,
+                    "legacy_balanced": 80000,
+                    "legacy_fast": 20000,
+                },
             },
             sort_keys=False,
         ),

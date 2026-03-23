@@ -70,6 +70,7 @@ class VertexModelRouter:
     """Select and record Vertex AI routes for a task attempt."""
 
     vertex_config: VertexConfig
+    preferred_profile: str | None = None
     ledger: RouteFailureLedger = field(default_factory=RouteFailureLedger)
     audit_log: RouteAuditLog = field(default_factory=RouteAuditLog)
 
@@ -81,10 +82,11 @@ class VertexModelRouter:
         hints: list[str],
     ) -> ModelRouteRecord:
         profiles = self._ordered_profiles()
+        preferred_profile = self._select_preferred_profile(profiles)
         index_floor = self._baseline_index(task.assigned_role, hints, len(profiles))
         failure_count = self.ledger.failure_count(attempt.id)
         selected_index = min(index_floor + failure_count, len(profiles) - 1)
-        selected_profile = profiles[selected_index]
+        selected_profile = preferred_profile or profiles[selected_index]
         previous_model = self.ledger.last_route(attempt.id)
         route_reason = self._build_route_reason(
             task=task,
@@ -92,6 +94,7 @@ class VertexModelRouter:
             selected_profile=selected_profile,
             index_floor=index_floor,
             failure_count=failure_count,
+            preferred_profile=preferred_profile.name if preferred_profile is not None else None,
         )
         route = ModelRouteRecord(
             workflow_run_id=task.workflow_run_id,
@@ -118,6 +121,15 @@ class VertexModelRouter:
                 return ordered
         return list(self.vertex_config.profile_definitions)
 
+    def _select_preferred_profile(self, profiles: list[VertexProfileConfig]) -> VertexProfileConfig | None:
+        preferred = (self.preferred_profile or "").strip()
+        if not preferred:
+            return None
+        for profile in profiles:
+            if profile.name == preferred:
+                return profile
+        return None
+
     def _baseline_index(self, role: str, hints: list[str], profile_count: int) -> int:
         baseline = _ROLE_BASELINE.get(role, 0)
         for hint in hints:
@@ -138,9 +150,10 @@ class VertexModelRouter:
         selected_profile: VertexProfileConfig,
         index_floor: int,
         failure_count: int,
+        preferred_profile: str | None = None,
     ) -> str:
         hint_text = ",".join(hints) if hints else "none"
-        return (
+        route_reason = (
             f"role={task.assigned_role}; "
             f"hints={hint_text}; "
             f"baseline_index={index_floor}; "
@@ -148,3 +161,6 @@ class VertexModelRouter:
             f"profile={selected_profile.name}; "
             f"model={selected_profile.model}"
         )
+        if preferred_profile is not None:
+            route_reason += f"; forced_profile={preferred_profile}"
+        return route_reason

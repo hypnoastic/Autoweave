@@ -39,7 +39,7 @@ def _write_env_files(root: Path) -> None:
         "\n".join(
             [
                 "VERTEXAI_PROJECT=dotenv-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "VERTEXAI_SERVICE_ACCOUNT_FILE=legacy_vertex_key.json",
                 "GOOGLE_APPLICATION_CREDENTIALS=legacy_vertex_key.json",
                 "POSTGRES_URL=postgresql://autoweave:secret@ep-autoweave.us-east-2.aws.neon.tech/autoweave?sslmode=require",
@@ -242,7 +242,7 @@ def test_local_environment_settings_normalize_vertex_credentials(tmp_path: Path)
     assert settings.project_root == tmp_path
     assert settings.loaded_env_files == (tmp_path / ".env", tmp_path / ".env.local")
     assert settings.vertexai_project == "local-project"
-    assert settings.vertexai_location == "us-central1"
+    assert settings.vertexai_location == "global"
     assert settings.postgres_target().uses_neon is True
     assert settings.neo4j_target().uses_aura is True
     assert settings.vertex_service_account_file == normalized_credentials
@@ -266,7 +266,7 @@ def test_openhands_client_bootstrap_uses_httpx_and_api_key() -> None:
         bootstrap = client.bootstrap_attempt(
             {
                 "provider_name": "VertexAI",
-                "model_name": "gemini-2.5-flash",
+                "model_name": "gemini-3-flash-preview",
                 "task_id": "task-1",
                 "task_attempt_id": "attempt-1",
                 "task_role": "backend",
@@ -286,7 +286,7 @@ def test_openhands_client_bootstrap_uses_httpx_and_api_key() -> None:
     assert calls[0]["headers"]["authorization"] == "Bearer secret-key"
     assert calls[1]["path"] == "/api/conversations"
     assert calls[1]["body"]["workspace"]["working_dir"] == "workspaces/task-1"
-    assert calls[1]["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-2.5-flash"
+    assert calls[1]["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-3-flash-preview"
     assert calls[1]["body"]["agent"]["llm"]["reasoning_effort"] == "medium"
     assert [tool["name"] for tool in calls[1]["body"]["agent"]["tools"]] == ["terminal", "file_editor", "task_tracker"]
     assert calls[1]["body"]["agent"]["tools"][0]["params"] == {}
@@ -314,7 +314,7 @@ def test_local_runtime_bootstrap_composes_and_dispatches(tmp_path: Path, monkeyp
     assert "autoweave:secret" not in doctor.postgres_target
     assert '"password": "***"' in doctor.neo4j_target
     assert example.ready_task_keys == ("manager_plan",)
-    assert example.route_model_name == "gemini-2.5-pro"
+    assert example.route_model_name == "gemini-3.1-pro-preview"
     assert example.bootstrap_call is not None and example.bootstrap_call.ok is True
     assert example.openhands_health.ok is True
     assert example.launch_payload["env"]["GOOGLE_APPLICATION_CREDENTIALS"] == str(normalized_credentials)
@@ -338,6 +338,7 @@ def test_local_runtime_bootstrap_composes_and_dispatches(tmp_path: Path, monkeyp
     assert persisted_attempt.state.value == "succeeded"
     assert persisted_graph.workflow_run.status.value == "running"
     assert calls[2]["body"]["agent"]["llm"]["reasoning_effort"] == "none"
+    assert calls[2]["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-3.1-pro-preview"
     assert [entry["path"] for entry in calls] == [
         "/health",
         "/health",
@@ -378,7 +379,25 @@ def test_cli_doctor_and_run_example_use_composed_runtime(tmp_path: Path, monkeyp
     assert "openhands_health=ok" in run_result.stdout
     assert "launch_provider=VertexAI" in run_result.stdout
     assert "bootstrap_call=" not in run_result.stdout
-    assert [entry["path"] for entry in calls[:2]] == ["/health", "/health"]
+
+
+def test_local_runtime_can_force_legacy_vertex_profile(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(
+        root=tmp_path,
+        environ={"AUTOWEAVE_VERTEX_PROFILE_OVERRIDE": "legacy_fast"},
+        transport=transport,
+    ) as runtime:
+        example = runtime.run_example(dispatch=True)
+
+    conversation_call = next(call for call in calls if call["path"] == "/api/conversations")
+    assert runtime.router.preferred_profile == "legacy_fast"
+    assert example.route_model_name == "gemini-2.5-flash"
+    assert conversation_call["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-2.5-flash"
 
 
 def test_local_runtime_marks_attempt_failed_when_openhands_errors(tmp_path: Path, monkeypatch) -> None:

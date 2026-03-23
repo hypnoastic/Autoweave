@@ -158,7 +158,10 @@ class LocalRuntime:
         except KeyError:
             storage.workflow_repository.save_graph(workflow_graph)
             canonical_graph = storage.workflow_repository.get_graph(workflow_graph.workflow_run.id)
-        router = VertexModelRouter(vertex_config)
+        router = VertexModelRouter(
+            vertex_config,
+            preferred_profile=settings.autoweave_vertex_profile_override,
+        )
         observability = LocalObservabilityService.from_settings(settings)
         event_service = observability.event_service
         worker_adapter = OpenHandsRemoteWorkerAdapter(

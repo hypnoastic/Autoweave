@@ -244,6 +244,7 @@ class LocalEnvironmentSettings(BaseModel):
     autoweave_storage_config: Path = Field(default=Path("configs/runtime/storage.yaml"))
     autoweave_vertex_config: Path = Field(default=Path("configs/runtime/vertex.yaml"))
     autoweave_observability_config: Path = Field(default=Path("configs/runtime/observability.yaml"))
+    autoweave_vertex_profile_override: str | None = None
 
     autoweave_canonical_backend: str = "sqlite"
     autoweave_graph_backend: str = "sqlite"
@@ -277,7 +278,7 @@ class LocalEnvironmentSettings(BaseModel):
             project_root=project_root,
             loaded_env_files=loaded_files,
             vertexai_project=get_env_value(env_map, "VERTEXAI_PROJECT"),
-            vertexai_location=get_env_value(env_map, "VERTEXAI_LOCATION"),
+            vertexai_location=get_env_value(env_map, "VERTEXAI_LOCATION", "global"),
             vertex_service_account_file=resolve_repo_path(project_root, vertex_value),
             google_application_credentials=resolve_repo_path(project_root, google_value),
             postgres_url=get_env_value(env_map, "POSTGRES_URL"),
@@ -294,6 +295,7 @@ class LocalEnvironmentSettings(BaseModel):
             autoweave_storage_config=Path(get_env_value(env_map, "AUTOWEAVE_STORAGE_CONFIG", "configs/runtime/storage.yaml")),
             autoweave_vertex_config=Path(get_env_value(env_map, "AUTOWEAVE_VERTEX_CONFIG", "configs/runtime/vertex.yaml")),
             autoweave_observability_config=Path(get_env_value(env_map, "AUTOWEAVE_OBSERVABILITY_CONFIG", "configs/runtime/observability.yaml")),
+            autoweave_vertex_profile_override=get_env_value(env_map, "AUTOWEAVE_VERTEX_PROFILE_OVERRIDE") or None,
             autoweave_canonical_backend=get_env_value(env_map, "AUTOWEAVE_CANONICAL_BACKEND", "sqlite"),
             autoweave_graph_backend=get_env_value(env_map, "AUTOWEAVE_GRAPH_BACKEND", "sqlite"),
             autoweave_postgres_schema=get_env_value(env_map, "AUTOWEAVE_POSTGRES_SCHEMA", "autoweave"),

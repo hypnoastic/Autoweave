@@ -143,7 +143,7 @@ def test_packaged_fresh_install_demo(tmp_path: Path) -> None:
             runner = CliRunner()
             env = {
                 "VERTEXAI_PROJECT": "packaged-demo",
-                "VERTEXAI_LOCATION": "us-central1",
+                "VERTEXAI_LOCATION": "global",
                 "VERTEXAI_SERVICE_ACCOUNT_FILE": "./config/secrets/vertex_service_account.json",
                 "GOOGLE_APPLICATION_CREDENTIALS": "./config/secrets/vertex_service_account.json",
                 "POSTGRES_URL": "postgresql://user:secret@db.example.com/autoweave",

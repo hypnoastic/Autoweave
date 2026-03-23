@@ -10,7 +10,8 @@
 - Native repo validation and packaged fresh-install validation both completed successfully against the real local/remote environment mix.
 - Vertex IAM is now fixed and direct Vertex calls succeed.
 - M10 is now implemented for the Vertex/OpenHands stabilization pass: the worker path no longer loops on repeated empty model responses.
-- The current live limitation is external Vertex capacity behavior: the patched worker path now either progresses normally or exits once through the existing timeout/finalization path if Vertex leaves the conversation running or returns rate-limit pressure.
+- M11 is now implemented for the Gemini 3 migration pass: local/dev routing now prefers Gemini 3 on the Vertex `global` endpoint while preserving explicit Gemini 2.5 fallback profiles.
+- The current live limitation is external Vertex preview-model capacity variability rather than provider routing, IAM, or empty-response loop behavior.
 
 ## Milestones
 
@@ -103,6 +104,21 @@
   - OpenHands no longer spins on repeated empty responses; the prior stuck-loop symptom is replaced by normal completion or a single terminal failure path
   - repo-root `doctor` succeeds again after repairing the checked-in runtime schema/config mismatch (`celery_queue_names`)
   - repo-root `run-example --root . --dispatch` no longer loops and now fails once through the normal timeout/finalization path when the live conversation remains running
+
+### M11. Gemini 3 model migration and reliability evaluation
+
+- Audit every place where Gemini 2.5 is configured, defaulted, normalized, or assumed in the AutoWeave -> OpenHands -> Vertex path.
+- Verify current supported Gemini 3 model IDs on Vertex AI from official sources before updating runtime profiles.
+- Add a controlled config switch so local/dev routing can prefer Gemini 3 while retaining Gemini 2.5 as a fallback profile.
+- Evaluate at least one Gemini 3 Flash path first, then `gemini-3.1-pro-preview` if supported, and compare direct LiteLLM behavior, OpenHands behavior, and repo-root example flow stability.
+- Verification result:
+  - model/provider routing remains `VertexAI` -> `vertex_ai/<model>`
+  - deprecated Gemini 3 IDs are not the default
+  - local/dev defaults now use `gemini-3.1-pro-preview` for planner and `gemini-3-flash-preview` for balanced/fast routes
+  - Gemini 2.5 remains available as `legacy_planner`, `legacy_balanced`, and `legacy_fast`
+  - the best available local/dev endpoint is now recorded as `VERTEXAI_LOCATION=global`
+  - direct LiteLLM smoke, OpenHands runtime validation, and repo-root `run-example --dispatch` succeeded with Gemini 3
+  - failures continue to surface as clear terminal diagnostics instead of empty-response loops
 
 ## Workstreams and ownership
 
@@ -224,6 +240,13 @@
 - direct LiteLLM reproduction coverage for non-streaming and streaming behavior where feasible
 - regression tests for empty-response guardrails, tool-enabled/tool-disabled handling, and non-looping OpenHands failure behavior
 
+### M11
+
+- config-loader tests for Gemini 3 profile definitions and default-selection behavior
+- routing tests that verify the active default model can move to Gemini 3 without breaking Vertex normalization
+- worker-path tests that verify OpenHands requests carry the selected Gemini 3 model string correctly
+- live comparison steps for direct provider smoke tests, OpenHands runs, and repo-root example flow with Gemini 2.5 fallback preserved
+
 ## Credential-dependent gates
 
 - Use the existing local env and secret material already present in the workspace rather than inventing new credentials.
@@ -243,5 +266,5 @@
   - full `pytest -q`
   - repo-root `doctor` and `run-example --dispatch`
   - packaged `autoweave bootstrap`, `validate`, `doctor`, and `run-example --dispatch`
-- The next pass focuses on the OpenHands/LiteLLM/Vertex empty-response loop now that IAM is no longer the blocking issue.
-- The next pass should focus on broader live-run quality: mounting richer repo context into attempt workspaces, surfacing upstream Vertex rate-limit failures more directly than a generic poll timeout when possible, and tuning model/profile defaults after the empty-response loop fix.
+- The Gemini 3 migration pass is now complete: local/dev defaults are Gemini 3-first on `global`, with Gemini 2.5 preserved as fallback.
+- The next pass should focus on broader live-run quality such as richer workspace seeding, quota-aware model fallback, and clearer rate-limit diagnostics under preview-model capacity pressure.

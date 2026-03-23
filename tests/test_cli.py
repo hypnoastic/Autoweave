@@ -73,6 +73,21 @@ def test_validate_command_detects_missing_docs(tmp_path: Path) -> None:
     assert "missing=docs/autoweave_diagrams_source.md" in result.stdout
 
 
+def test_bootstrap_vertex_defaults_prefer_gemini_3_and_keep_legacy_profiles(tmp_path: Path) -> None:
+    _write_docs(tmp_path)
+    bootstrap_repository(tmp_path)
+
+    vertex_config = yaml.safe_load((tmp_path / "configs" / "runtime" / "vertex.yaml").read_text(encoding="utf-8"))
+    profiles = {profile["name"]: profile["model"] for profile in vertex_config["profile_definitions"]}
+
+    assert profiles["planner"] == "gemini-3.1-pro-preview"
+    assert profiles["balanced"] == "gemini-3-flash-preview"
+    assert profiles["fast"] == "gemini-3-flash-preview"
+    assert profiles["legacy_planner"] == "gemini-2.5-pro"
+    assert profiles["legacy_fast"] == "gemini-2.5-flash"
+    assert "gemini-3-pro-preview" not in {profiles["planner"], profiles["balanced"], profiles["fast"]}
+
+
 def test_module_entrypoint_invokes_main(tmp_path: Path) -> None:
     _write_docs(tmp_path)
     bootstrap_repository(tmp_path)

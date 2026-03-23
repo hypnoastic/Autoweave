@@ -134,7 +134,7 @@ def new_project(
     # Create .env.local
     (path / ".env.local").write_text(
         """VERTEXAI_PROJECT=
-VERTEXAI_LOCATION=
+VERTEXAI_LOCATION=global
 VERTEXAI_SERVICE_ACCOUNT_FILE=./config/secrets/vertex_service_account.json
 GOOGLE_APPLICATION_CREDENTIALS=./config/secrets/vertex_service_account.json
 POSTGRES_URL=
@@ -144,6 +144,7 @@ NEO4J_USERNAME=
 NEO4J_PASSWORD=
 ARTIFACT_STORE_URL=file://./var/artifacts
 OPENHANDS_AGENT_SERVER_BASE_URL=http://127.0.0.1:8000
+AUTOWEAVE_VERTEX_PROFILE_OVERRIDE=
 """,
         encoding="utf-8",
     )

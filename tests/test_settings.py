@@ -70,7 +70,7 @@ def test_settings_default_local_paths_and_worker_environment(tmp_path: Path) -> 
         "\n".join(
             [
                 "VERTEXAI_PROJECT=demo-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "POSTGRES_URL=postgresql://user@host/db",
                 "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
             ]
@@ -93,13 +93,35 @@ def test_settings_default_local_paths_and_worker_environment(tmp_path: Path) -> 
     assert settings.postgres_target().host == "host"
 
 
+def test_settings_load_vertex_profile_override(tmp_path: Path) -> None:
+    _seed_repo(tmp_path)
+    (tmp_path / ".env.local").write_text(
+        "\n".join(
+            [
+                "VERTEXAI_PROJECT=demo-project",
+                "VERTEXAI_LOCATION=global",
+                "POSTGRES_URL=postgresql://user@host/db",
+                "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
+                "AUTOWEAVE_VERTEX_PROFILE_OVERRIDE=legacy_balanced",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "credentials.json").write_text("{}", encoding="utf-8")
+
+    settings = LocalEnvironmentSettings.load(root=tmp_path)
+
+    assert settings.autoweave_vertex_profile_override == "legacy_balanced"
+
+
 def test_settings_resolve_file_dot_artifact_store_relative_to_repo(tmp_path: Path) -> None:
     _seed_repo(tmp_path)
     (tmp_path / ".env.local").write_text(
         "\n".join(
             [
                 "VERTEXAI_PROJECT=demo-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "POSTGRES_URL=postgresql://user@host/db",
                 "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
                 "ARTIFACT_STORE_URL=file://./var/artifacts",
@@ -121,7 +143,7 @@ def test_connection_targets_redact_embedded_credentials(tmp_path: Path) -> None:
         "\n".join(
             [
                 "VERTEXAI_PROJECT=demo-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "POSTGRES_URL=postgresql://user:super-secret@host/db?sslmode=require",
                 "REDIS_URL=redis://:redis-secret@127.0.0.1:6379/0",
                 "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",

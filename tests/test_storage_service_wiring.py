@@ -39,7 +39,7 @@ def _write_env(root: Path) -> None:
         "\n".join(
             [
                 "VERTEXAI_PROJECT=local-project",
-                "VERTEXAI_LOCATION=us-central1",
+                "VERTEXAI_LOCATION=global",
                 "VERTEXAI_SERVICE_ACCOUNT_FILE=./config/secrets/vertex_service_account.json",
                 "GOOGLE_APPLICATION_CREDENTIALS=./config/secrets/vertex_service_account.json",
                 "ARTIFACT_STORE_URL=file://./var/artifacts",
@@ -81,7 +81,7 @@ def test_local_environment_settings_and_targets_are_normalized(tmp_path: Path) -
     settings = LocalEnvironmentSettings.load(root=tmp_path)
 
     assert settings.vertexai_project == "local-project"
-    assert settings.vertexai_location == "us-central1"
+    assert settings.vertexai_location == "global"
     assert settings.vertex_service_account_file == (tmp_path / CANONICAL_VERTEX_CREDENTIALS).resolve()
     assert settings.google_application_credentials == (tmp_path / CANONICAL_VERTEX_CREDENTIALS).resolve()
     assert settings.postgres_target().uses_neon is True
