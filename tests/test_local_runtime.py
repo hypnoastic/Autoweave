@@ -416,6 +416,98 @@ def test_local_runtime_run_workflow_stops_on_human_input_request(tmp_path: Path,
     assert report.step_reports[0].task_state == "waiting_for_human"
 
 
+def test_local_runtime_can_resume_after_human_answer(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        initial = runtime.run_workflow(
+            request="Build a small clothing ecommerce site and ask for missing checkout details.",
+            dispatch=True,
+            max_steps=1,
+            stream_events_by_task={
+                "manager_plan": (
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "HUMAN_INPUT_REQUIRED: Which payment providers and shipping regions should the first release support?",
+                                }
+                            ],
+                            "tool_calls": None,
+                        },
+                    },
+                ),
+            },
+        )
+        request = runtime.storage.workflow_repository.list_human_requests_for_run(initial.workflow_run_id)[0]
+        resumed = runtime.answer_human_request(
+            workflow_run_id=initial.workflow_run_id,
+            request_id=request.id,
+            answer_text="Use Stripe only and ship within the US.",
+            answered_by="operator",
+            dispatch=True,
+            max_steps=1,
+        )
+        updated_request = runtime.storage.workflow_repository.get_human_request(request.id)
+
+    assert initial.open_human_questions == (
+        "Which payment providers and shipping regions should the first release support?",
+    )
+    assert updated_request.status.value == "answered"
+    assert updated_request.answer_text == "Use Stripe only and ship within the US."
+    assert resumed.dispatched_task_keys == ("manager_plan",)
+    assert resumed.open_human_questions == ()
+    assert resumed.step_reports[0].task_key == "manager_plan"
+    assert resumed.step_reports[0].task_state == "completed"
+    conversation_calls = [call for call in calls if call["path"] == "/api/conversations"]
+    assert len(conversation_calls) == 2
+    resumed_prompt = conversation_calls[1]["body"]["initial_message"]["content"][0]["text"]
+    assert "latest_human_answer" in resumed_prompt
+    assert "Use Stripe only and ship within the US." in resumed_prompt
+
+
+def test_local_runtime_waits_for_approval_and_can_resume_after_resolution(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        initial = runtime.run_workflow(
+            request="Build a small clothing ecommerce site with frontend, backend, integration, and review.",
+            dispatch=True,
+            max_steps=8,
+        )
+        approval_request = runtime.storage.workflow_repository.list_approval_requests_for_run(initial.workflow_run_id)[0]
+        resumed = runtime.resolve_approval_request(
+            workflow_run_id=initial.workflow_run_id,
+            request_id=approval_request.id,
+            approved=True,
+            resolved_by="operator",
+            dispatch=True,
+            max_steps=1,
+        )
+        updated_request = runtime.storage.workflow_repository.get_approval_request(approval_request.id)
+
+    assert initial.open_approval_reasons == ("Approval required before dispatch: human_review",)
+    assert any(step.task_key == "review" and step.task_state == "waiting_for_approval" for step in initial.step_reports)
+    assert updated_request.status.value == "approved"
+    assert resumed.dispatched_task_keys == ("review",)
+    assert resumed.step_reports[0].task_key == "review"
+    assert resumed.step_reports[0].task_state == "completed"
+    assert resumed.workflow_status == "completed"
+    conversation_calls = [call for call in calls if call["path"] == "/api/conversations"]
+    assert len(conversation_calls) == 6
+    assert conversation_calls[-1]["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-3-flash-preview"
+
+
 def test_cli_doctor_and_run_example_use_composed_runtime(tmp_path: Path, monkeypatch) -> None:
     _prepare_local_root(tmp_path)
     calls: list[dict[str, object]] = []
@@ -656,3 +748,37 @@ def test_local_runtime_avoids_full_graph_resync_for_state_only_updates(tmp_path:
     assert repository.save_runtime_state_calls >= 1
     assert repository.save_workflow_run_calls >= 1
     assert repository.save_task_calls >= 1
+
+
+def test_local_runtime_suppresses_duplicate_dispatch(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        monkeypatch.setattr(runtime.storage.idempotency_store, "claim", lambda *args, **kwargs: False)
+        example = runtime.run_example(dispatch=True)
+
+    assert example.failure_reason == "duplicate_dispatch_suppressed"
+    assert example.bootstrap_call is None
+    assert example.task_state == "ready"
+    assert example.attempt_state == "aborted"
+    assert [call["path"] for call in calls] == ["/health"]
+
+
+def test_local_runtime_blocks_when_dispatch_lease_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        monkeypatch.setattr(runtime.storage.lease_manager, "acquire", lambda *args, **kwargs: False)
+        example = runtime.run_example(dispatch=True)
+
+    assert example.failure_reason == "lease_unavailable"
+    assert example.bootstrap_call is None
+    assert example.task_state == "blocked"
+    assert example.attempt_state == "aborted"
+    assert [call["path"] for call in calls] == ["/health"]

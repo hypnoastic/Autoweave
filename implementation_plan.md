@@ -15,6 +15,7 @@
 - M12 is implemented for packaged fresh-install workflow demo validation with a custom team brief, clarification handling, and live monitoring through the installed CLI.
 - M13 is now implemented for separate bundled project templates plus a lightweight monitoring UI for local workflow inspection and launch, without changing the orchestrator boundary or adding a heavy frontend stack.
 - M14 is now implemented for upgrading the packaged demo-agent scaffold and making the monitor practical for live prompting and workflow observation.
+- M15 is now implemented for operator-console hardening, resumable human/approval flow, runtime policy enforcement, and live dispatch coordination; the remaining drift is external OpenHands/Vertex latency during some real downstream runs.
 
 ## Milestones
 
@@ -157,6 +158,20 @@
   - the monitor exposes the workflow blueprint, recent jobs, recent runs, and manager/task/attempt/artifact summaries clearly enough for interactive debugging
   - targeted CLI/monitor/template tests pass, full `pytest -q` passes, and the UI command can be started locally for manual use
 
+### M15. Final hardening and operator-console completion
+
+- Redesign the local monitor into a clearer operator console with chat-style interaction, grouped workflow runs, progressive disclosure, and explicit error states instead of indefinite loading.
+- Add a resumable live workflow path so the UI can start a run, surface clarification/approval requests, accept operator responses, and continue the same canonical workflow run rather than always starting over.
+- Load agent definitions into the runtime path so approval/autonomy policy, tool-group constraints, and model-profile hints become actual runtime behavior rather than static config only.
+- Enforce Redis-backed lease/idempotency behavior on the live dispatch path and add regression coverage around duplicate dispatch, resume/retry, and operator-loop state transitions.
+- Verification result:
+  - the UI loads into a usable operator console even when runtime/storage access degrades, and it surfaces load failures clearly
+  - manager chat start -> clarification/approval -> resume is supported through the UI/API and the local runtime
+  - approval/autonomy policy affects dispatch/runtime behavior and appears in task/UI state
+  - full `pytest -q` passes with new runtime, monitoring, and coordination coverage
+  - live repo-root validation and packaged-install validation both reach the real Dockerized/OpenHands/Vertex stack with exact commands recorded
+  - remaining external limitation: some downstream live tasks still hit OpenHands/Vertex timeout or generic worker-error paths, but those now finalize durably and surface clearly to the operator
+
 ## Workstreams and ownership
 
 ### Lead agent
@@ -194,6 +209,11 @@
 
 - Owns `autoweave/monitoring/`.
 - Responsible for the local run-inspection UI, workflow launch form, canonical read-only run summaries, promptable monitoring command surface, and workflow/agent visibility improvements.
+
+### Final hardening workstream
+
+- Owns the cross-cutting polish layer across `autoweave/local_runtime.py`, `autoweave/monitoring/`, `autoweave/compiler/`, `autoweave/workers/`, `autoweave/storage/`, and end-to-end tests.
+- Responsible for resumable operator flow, runtime policy enforcement, lease/idempotency use, degraded-mode UX, and final repo-root plus packaged validation.
 
 ## Interface boundaries
 

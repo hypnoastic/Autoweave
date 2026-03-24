@@ -31,6 +31,8 @@ class AgentDefinitionConfig(BaseConfigModel):
     model_profile_hints: list[str] = Field(default_factory=list)
     approval_policy: str
     human_interaction_policy: str
+    specialization: str | None = None
+    primary_skills: list[str] = Field(default_factory=list)
     artifact_contracts: list[ArtifactContractConfig] = Field(default_factory=list)
     route_priority: int = 100
 

@@ -398,7 +398,10 @@ class WorkflowRunState:
             }
         )
         self.human_requests[request.id] = request
-        if task.state == TaskState.WAITING_FOR_HUMAN and self._latest_active_attempt_id(task.id) == request.task_attempt_id:
+        latest_active_attempt_id = self._latest_active_attempt_id(task.id)
+        if task.state == TaskState.WAITING_FOR_HUMAN and (
+            latest_active_attempt_id is None or latest_active_attempt_id == request.task_attempt_id
+        ):
             task = task.transition(TaskState.READY)
             self.update_task(task)
         return request
@@ -444,7 +447,10 @@ class WorkflowRunState:
             }
         )
         self.approval_requests[request.id] = request
-        if task.state == TaskState.WAITING_FOR_APPROVAL and self._latest_active_attempt_id(task.id) == request.task_attempt_id:
+        latest_active_attempt_id = self._latest_active_attempt_id(task.id)
+        if task.state == TaskState.WAITING_FOR_APPROVAL and (
+            latest_active_attempt_id is None or latest_active_attempt_id == request.task_attempt_id
+        ):
             if approved:
                 task = task.transition(TaskState.READY)
             else:

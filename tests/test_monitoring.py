@@ -107,7 +107,8 @@ class _FakeRepository:
 
 
 class _FakeRuntime:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, recorder: list[tuple[str, dict[str, object]]] | None = None) -> None:
+        self._recorder = recorder if recorder is not None else []
         workflow_run = WorkflowRunRecord(
             id="run_demo_1",
             project_id="local",
@@ -177,12 +178,86 @@ class _FakeRuntime:
         return None
 
     def run_workflow(self, *, request: str, dispatch: bool, max_steps: int) -> LocalWorkflowRunReport:
+        self._recorder.append(
+            (
+                "start",
+                {"request": request, "dispatch": dispatch, "max_steps": max_steps},
+            )
+        )
         return LocalWorkflowRunReport(
             workflow_run_id="run_demo_2",
             request=request,
             workflow_status="running",
             dispatched_task_keys=("manager_plan",),
             ready_task_keys=("backend_contract", "frontend_ui"),
+            open_human_questions=(),
+            open_approval_reasons=(),
+            step_reports=(),
+        )
+
+    def answer_human_request(
+        self,
+        *,
+        workflow_run_id: str,
+        request_id: str,
+        answer_text: str,
+        answered_by: str,
+        dispatch: bool,
+        max_steps: int,
+    ) -> LocalWorkflowRunReport:
+        self._recorder.append(
+            (
+                "answer_human",
+                {
+                    "workflow_run_id": workflow_run_id,
+                    "request_id": request_id,
+                    "answer_text": answer_text,
+                    "answered_by": answered_by,
+                    "dispatch": dispatch,
+                    "max_steps": max_steps,
+                },
+            )
+        )
+        return LocalWorkflowRunReport(
+            workflow_run_id=workflow_run_id,
+            request=answer_text,
+            workflow_status="running",
+            dispatched_task_keys=("manager_plan",),
+            ready_task_keys=("backend_contract",),
+            open_human_questions=(),
+            open_approval_reasons=(),
+            step_reports=(),
+        )
+
+    def resolve_approval_request(
+        self,
+        *,
+        workflow_run_id: str,
+        request_id: str,
+        approved: bool,
+        resolved_by: str,
+        dispatch: bool,
+        max_steps: int,
+    ) -> LocalWorkflowRunReport:
+        self._recorder.append(
+            (
+                "resolve_approval",
+                {
+                    "workflow_run_id": workflow_run_id,
+                    "request_id": request_id,
+                    "approved": approved,
+                    "resolved_by": resolved_by,
+                    "dispatch": dispatch,
+                    "max_steps": max_steps,
+                },
+            )
+        )
+        return LocalWorkflowRunReport(
+            workflow_run_id=workflow_run_id,
+            request="approval",
+            workflow_status="running",
+            dispatched_task_keys=("review",),
+            ready_task_keys=(),
             open_human_questions=(),
             open_approval_reasons=(),
             step_reports=(),
@@ -243,10 +318,95 @@ def test_monitoring_dashboard_wsgi_app_serves_state_and_launch(tmp_path: Path) -
     launch = client.post("/api/run", json={"request": "Build a storefront", "max_steps": 3, "dispatch": True})
 
     assert index.status_code == 200
-    assert "AutoWeave Monitor" in index.text
-    assert "Prompt the manager entrypoint" in index.text
+    assert "AutoWeave Operator Console" in index.text
+    assert "Manager Chat" in index.text
     assert state.status_code == 200
+    assert state.json()["status"] == "ok"
+    assert state.json()["selected_run_id"] == "run_demo_1"
     assert state.json()["runs"][0]["id"] == "run_demo_1"
     assert state.json()["agents"][0]["role"] == "backend"
     assert launch.status_code == 202
     assert launch.json()["status"] in {"queued", "running", "completed"}
+
+
+def test_monitoring_service_snapshot_degrades_but_preserves_catalog(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+
+    def failing_runtime_factory(**kwargs):
+        raise RuntimeError("backend unavailable")
+
+    service = MonitoringService(root=tmp_path, runtime_factory=failing_runtime_factory)
+
+    payload = service.snapshot(limit=3)
+
+    assert payload["status"] == "degraded"
+    assert "backend unavailable" in str(payload["load_error"])
+    assert payload["agents"][0]["role"] == "backend"
+    assert payload["workflow_blueprint"]["entrypoint"] == "manager_plan"
+    assert payload["runs"] == []
+
+
+def test_monitoring_dashboard_wsgi_app_routes_chat_and_approval_actions(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+    recorder: list[tuple[str, dict[str, object]]] = []
+
+    def runtime_factory(*, root=None, environ=None, transport=None, bootstrap_path="/api/conversations", workflow_run_id=None):
+        return _FakeRuntime(Path(root or "."), recorder=recorder)
+
+    service = MonitoringService(root=tmp_path, runtime_factory=runtime_factory)
+    app = MonitoringDashboardApp(service)
+    client = httpx.Client(transport=httpx.WSGITransport(app=app), base_url="http://monitor.local")
+
+    new_run = client.post("/api/chat", json={"message": "Build a storefront", "dispatch": True, "max_steps": 2})
+    answer = client.post(
+        "/api/chat",
+        json={
+            "message": "Use Stripe and US shipping only.",
+            "workflow_run_id": "run_demo_1",
+            "human_request_id": "human_request_1",
+            "dispatch": True,
+            "max_steps": 2,
+        },
+    )
+    approval = client.post(
+        "/api/approval",
+        json={
+            "workflow_run_id": "run_demo_1",
+            "approval_request_id": "approval_request_1",
+            "approved": True,
+            "dispatch": True,
+            "max_steps": 1,
+        },
+    )
+
+    for _ in range(50):
+        if len(service.jobs()) >= 3 and all(job["status"] != "running" for job in service.jobs()[:3]):
+            break
+        time.sleep(0.01)
+
+    assert new_run.status_code == 202
+    assert answer.status_code == 202
+    assert approval.status_code == 202
+    assert ("start", {"request": "Build a storefront", "dispatch": True, "max_steps": 2}) in recorder
+    assert (
+        "answer_human",
+        {
+            "workflow_run_id": "run_demo_1",
+            "request_id": "human_request_1",
+            "answer_text": "Use Stripe and US shipping only.",
+            "answered_by": "operator",
+            "dispatch": True,
+            "max_steps": 2,
+        },
+    ) in recorder
+    assert (
+        "resolve_approval",
+        {
+            "workflow_run_id": "run_demo_1",
+            "request_id": "approval_request_1",
+            "approved": True,
+            "resolved_by": "operator",
+            "dispatch": True,
+            "max_steps": 1,
+        },
+    ) in recorder

@@ -614,3 +614,116 @@ Validation completed in this pass:
 Remaining limitation for this pass:
 
 - the monitor is useful for prompting and observing runs, but it still does not offer an in-UI answer/resume control for human blockers; open human requests are visible and authoritative state remains orchestrator-owned
+
+## Gap analysis: 2026-03-24 final hardening pass
+
+UI/UX gaps:
+
+- the current monitor still behaves like a polling dashboard rather than a true operator console; it lacks a proper chat-oriented interaction flow for starting a run, answering clarification requests, and resolving approvals
+- the page layout is still too flat and noisy; runs are rendered as large cards without strong grouping, selection, or progressive disclosure
+- the UI can remain stuck on `Loading...` if `/api/state` fails because the frontend does not surface load errors clearly enough and the backend snapshot path depends too heavily on live runtime construction
+- agent/task/attempt/artifact visibility exists but is still not arranged cleanly for fast debugging
+
+Orchestration/runtime gaps:
+
+- the workflow engine handles static DAG execution well, but the local runtime still lacks an explicit continue/resume path for an existing workflow run after human input or approval
+- the local runtime always resets a new workflow run for `run_workflow`, which prevents the UI from acting like an actual ongoing manager-facing conversation
+- some runtime behavior still bypasses agent-level config because agent definitions are not yet loaded into the dispatch path as first-class runtime inputs
+
+Storage/repository gaps:
+
+- the durable repository path is present, but snapshot and UI flows are still too brittle around storage/network errors; the monitor needs a degraded-but-usable mode rather than a total failure
+- repository-backed state is available, but the UI/API does not yet expose a clean selected-run view or a focused chat transcript built from canonical run data
+
+OpenHands execution gaps:
+
+- the worker path can dispatch and finalize, but human clarification resume and approval resume are not yet completed end to end
+- the runtime can still create a stalled operator experience when the worker path fails because the UI does not present terminal diagnostics as first-class chat/status events
+
+Approval/autonomy gaps:
+
+- `approval_policy` and `human_interaction_policy` exist in `autoweave.yaml`, but they are only validated as config fields today; they are not yet interpreted as real runtime policy
+- low-autonomy versus high-autonomy behavior is therefore not consistently reflected in task transitions, UI state, or dispatch decisions
+
+Agent lifecycle gaps:
+
+- the runtime currently opens attempts without using agent definition metadata for tool groups, model hints, or approval/autonomy semantics
+- there is no explicit operator-facing flow for resuming a blocked task attempt after human input or approval
+
+DAG scheduling gaps:
+
+- dependency scheduling, branch-local blocking, and fan-out are covered, but the resume path after `waiting_for_human` or `waiting_for_approval` is incomplete in the live runtime loop
+
+Redis/Celery/lease/heartbeat gaps:
+
+- Redis coordination objects exist, but the main local dispatch path does not yet acquire/release leases or use idempotency keys around dispatch
+- Celery queue config exists, but the local runtime still executes synchronously in-process rather than proving a real queued orchestration path
+
+Observability gaps:
+
+- event persistence exists, but the UI does not yet translate canonical events into a focused progress timeline or operator chat transcript
+- load/runtime failures are not surfaced cleanly enough in the UI
+
+Test gaps:
+
+- there is still no strong end-to-end coverage for manager chat start -> human clarification -> answer -> resumed execution -> approval handling in one run
+- there is no dedicated regression coverage for degraded UI state, approval policy interpretation, or lease/idempotency use in the live dispatch path
+
+Packaging/fresh-install gaps:
+
+- packaged installs work, but the shipped monitor experience still needs the same chat/resume/polish improvements as the repo-root flow
+
+End-to-end run gaps:
+
+- the live end-to-end flow still depends on direct CLI dispatch rather than a polished manager-facing console flow
+- the current environment also proves that external network or local loopback failure can degrade the operator experience unless those errors are handled explicitly
+
+## Final hardening implementation update: 2026-03-24
+
+What was already implemented before this slice:
+
+- canonical workflow persistence, task/attempt/artifact/event models, Dockerized local runtime, CLI entrypoints, installed-project bootstrap, and a first-pass monitoring UI already existed
+- the repo already had a workable OpenHands/Vertex path, but the monitor still felt like a thin polling dashboard and the live operator loop was incomplete
+
+What was broken or incomplete when this pass started:
+
+- the monitor could still sit on `Loading...` when runtime or config construction failed early
+- the UI was not structured like a usable operator console and did not group runs progressively
+- runtime reload only restored the workflow graph, not attempts, human requests, or approval requests, so resuming an existing run through the UI/API was broken
+- answered human requests and resolved approvals did not cleanly continue the same canonical run
+- agent config fields used by the packaged scaffold (`specialization`, `primary_skills`) were stricter than the current runtime model accepted
+- approval/autonomy config existed, but only task-template approval gates reliably affected dispatch
+- Redis-backed duplicate-dispatch and lease-unavailable branches existed in code but did not yet have regression coverage
+
+What changed in this pass:
+
+- extended `AgentDefinitionConfig` so the packaged agent metadata is part of the validated runtime contract
+- upgraded the monitor into an operator-console layout with a chat-style center column, grouped/collapsible run sections, clearer detail panes, and explicit degraded/error banners instead of indefinite loading
+- added `/api/chat` and `/api/approval` operator actions so the same selected canonical run can receive a human answer or approval decision from the UI
+- made monitor snapshots resilient: agent catalog and workflow blueprint now degrade independently, and the workflow blueprint follows `AUTOWEAVE_DEFAULT_WORKFLOW` instead of a hardcoded path
+- loaded agent definitions into the live dispatch path so model-profile hints, allowed tool groups, and approval-relevant metadata actually affect worker launch payloads
+- added resumable runtime entrypoints for continuing a workflow run, answering human requests, and resolving approval requests
+- fixed runtime reload to rehydrate attempts, human requests, and approval requests from canonical storage, not just the graph
+- fixed approval resume so an approval-gated queued attempt does not block the resumed dispatch
+- kept approval requirements authoritative: approved requests for a task satisfy the pre-dispatch gate instead of re-requesting approval forever
+- added regression coverage for the operator-console API, degraded snapshot behavior, human-answer resume, approval resume, duplicate-dispatch suppression, and lease-unavailable blocking
+
+Validation completed in this slice:
+
+- `python3 -m compileall autoweave apps tests`
+- `.venv/bin/python -m pytest -q`
+- live repo-root doctor against the configured Neon/Aura/Redis/OpenHands/Vertex stack: passed
+- live repo-root workflow run against the real stack:
+  - `manager_plan` completed successfully
+  - downstream `backend_contract` and `frontend_ui` were genuinely dispatched in parallel
+  - both downstream branches surfaced timeout/orphan diagnostics cleanly instead of stalling invisibly
+- packaged fresh-install validation:
+  - built wheel and installed into a clean venv
+  - created and bootstrapped a fresh project
+  - installed `validate` and `doctor` commands passed against the real stack
+  - installed live workflow runs reached real OpenHands conversations and durable task state updates, but downstream completion remained sensitive to external worker/model latency
+
+Current remaining limitation for this version:
+
+- the library/runtime/orchestrator path is now internally consistent and test-covered, but fully successful multi-step live completion still depends on external OpenHands plus Vertex response latency; in this environment that sometimes produces `conversation poll timed out` or a generic worker error on downstream branches
+- the operator console now makes those failures visible and resumable, but it cannot eliminate upstream model/runtime variability by itself

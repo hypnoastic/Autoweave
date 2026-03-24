@@ -9,8 +9,10 @@ from threading import Lock, Thread
 from typing import Any, Callable, Mapping
 import yaml
 
+from autoweave.compiler.loader import CanonicalConfigLoader
 from autoweave.local_runtime import LocalWorkflowRunReport, build_local_runtime
 from autoweave.models import ArtifactRecord, ApprovalRequestRecord, EventRecord, HumanRequestRecord, TaskAttemptRecord, TaskRecord, WorkflowRunRecord, generate_id
+from autoweave.settings import LocalEnvironmentSettings
 
 
 def _iso(value: object) -> str | None:
@@ -42,22 +44,30 @@ def _short_json(value: object, *, max_length: int = 360) -> str:
 @dataclass(slots=True)
 class MonitoringJob:
     id: str
+    action: str
     request: str
     dispatch: bool
     max_steps: int
     status: str = "queued"
     workflow_run_id: str | None = None
+    human_request_id: str | None = None
+    approval_request_id: str | None = None
+    approved: bool | None = None
     error: str | None = None
     report: LocalWorkflowRunReport | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "id": self.id,
+            "action": self.action,
             "request": self.request,
             "dispatch": self.dispatch,
             "max_steps": self.max_steps,
             "status": self.status,
             "workflow_run_id": self.workflow_run_id,
+            "human_request_id": self.human_request_id,
+            "approval_request_id": self.approval_request_id,
+            "approved": self.approved,
             "error": self.error,
         }
         if self.report is not None:
@@ -91,30 +101,49 @@ class MonitoringService:
         self._jobs: dict[str, MonitoringJob] = {}
         self._lock = Lock()
 
+    def _runtime(self, *, workflow_run_id: str | None = None):
+        kwargs: dict[str, Any] = {
+            "root": self.root,
+            "environ": self.environ,
+        }
+        if workflow_run_id is not None:
+            kwargs["workflow_run_id"] = workflow_run_id
+        try:
+            return self._runtime_factory(**kwargs)
+        except TypeError:
+            kwargs.pop("workflow_run_id", None)
+            return self._runtime_factory(**kwargs)
+
+    def _loader(self) -> CanonicalConfigLoader:
+        return CanonicalConfigLoader(root_dir=self.root)
+
     def workflow_blueprint(self) -> dict[str, Any]:
-        with self._runtime_factory(root=self.root, environ=self.environ) as runtime:
-            templates = []
-            for template in runtime.workflow_definition.task_templates:
-                templates.append(
-                    {
-                        "key": template.key,
-                        "title": template.title,
-                        "assigned_role": template.assigned_role,
-                        "description_template": getattr(template, "description_template", ""),
-                        "hard_dependencies": list(template.hard_dependencies),
-                        "soft_dependencies": list(template.soft_dependencies),
-                        "produced_artifacts": list(template.produced_artifacts),
-                        "required_artifacts": list(template.required_artifacts),
-                        "route_hints": list(getattr(template, "route_hints", [])),
-                    }
-                )
-            return {
-                "name": runtime.workflow_definition.name,
-                "version": runtime.workflow_definition.version,
-                "entrypoint": runtime.workflow_definition.entrypoint,
-                "roles": list(runtime.workflow_definition.roles),
-                "templates": templates,
-            }
+        settings = LocalEnvironmentSettings.load(root=self.root, environ=self.environ)
+        loader = self._loader()
+        workflow_definition = loader.load_workflow_definition(settings.autoweave_default_workflow)
+        templates = []
+        for template in workflow_definition.task_templates:
+            templates.append(
+                {
+                    "key": template.key,
+                    "title": template.title,
+                    "assigned_role": template.assigned_role,
+                    "description_template": getattr(template, "description_template", ""),
+                    "hard_dependencies": list(template.hard_dependencies),
+                    "soft_dependencies": list(template.soft_dependencies),
+                    "produced_artifacts": list(template.produced_artifacts),
+                    "required_artifacts": list(template.required_artifacts),
+                    "route_hints": list(getattr(template, "route_hints", [])),
+                    "approval_requirements": list(getattr(template, "approval_requirements", [])),
+                }
+            )
+        return {
+            "name": workflow_definition.name,
+            "version": workflow_definition.version,
+            "entrypoint": workflow_definition.entrypoint,
+            "roles": list(workflow_definition.roles),
+            "templates": templates,
+        }
 
     def agent_catalog(self) -> list[dict[str, Any]]:
         agents_root = self.root / "agents"
@@ -147,15 +176,31 @@ class MonitoringService:
         return agents
 
     def snapshot(self, *, limit: int = 5) -> dict[str, Any]:
-        with self._runtime_factory(root=self.root, environ=self.environ) as runtime:
-            repository = runtime.storage.workflow_repository
-            runs = repository.list_workflow_runs()[:limit]
-            return {
-                "project_root": str(runtime.settings.project_root),
-                "agents": self.agent_catalog(),
-                "workflow_blueprint": self.workflow_blueprint(),
-                "jobs": self.jobs(),
-                "runs": [
+        base_payload = {
+            "status": "ok",
+            "load_error": None,
+            "project_root": str(self.root),
+            "agents": [],
+            "workflow_blueprint": {"name": None, "version": None, "entrypoint": None, "roles": [], "templates": []},
+            "jobs": self.jobs(),
+            "runs": [],
+            "selected_run_id": None,
+            "selected_run": None,
+        }
+        base_errors: list[str] = []
+        try:
+            base_payload["agents"] = self.agent_catalog()
+        except Exception as exc:
+            base_errors.append(f"agent catalog unavailable: {exc}")
+        try:
+            base_payload["workflow_blueprint"] = self.workflow_blueprint()
+        except Exception as exc:
+            base_errors.append(f"workflow blueprint unavailable: {exc}")
+        try:
+            with self._runtime() as runtime:
+                repository = runtime.storage.workflow_repository
+                runs = repository.list_workflow_runs()[:limit]
+                run_payloads = [
                     self._run_payload(
                         runtime=runtime,
                         workflow_run=workflow_run,
@@ -167,7 +212,23 @@ class MonitoringService:
                         events=repository.list_events(workflow_run.id),
                     )
                     for workflow_run in runs
-                ],
+                ]
+                selected_run = run_payloads[0] if run_payloads else None
+                return {
+                    **base_payload,
+                    "status": "degraded" if base_errors else "ok",
+                    "load_error": "\n".join(base_errors) or None,
+                    "project_root": str(runtime.settings.project_root),
+                    "runs": run_payloads,
+                    "selected_run_id": selected_run["id"] if selected_run is not None else None,
+                    "selected_run": selected_run,
+                }
+        except Exception as exc:
+            combined_errors = [*base_errors, "".join(traceback.format_exception_only(type(exc), exc)).strip()]
+            return {
+                **base_payload,
+                "status": "degraded",
+                "load_error": "\n".join(item for item in combined_errors if item),
             }
 
     def jobs(self) -> list[dict[str, Any]]:
@@ -177,11 +238,67 @@ class MonitoringService:
         return jobs
 
     def launch_workflow(self, *, request: str, dispatch: bool = True, max_steps: int = 8) -> dict[str, Any]:
+        return self._enqueue_job(action="start", request=request, dispatch=dispatch, max_steps=max_steps)
+
+    def answer_human_request(
+        self,
+        *,
+        workflow_run_id: str,
+        request_id: str,
+        answer_text: str,
+        dispatch: bool = True,
+        max_steps: int = 8,
+    ) -> dict[str, Any]:
+        return self._enqueue_job(
+            action="answer_human",
+            request=answer_text,
+            workflow_run_id=workflow_run_id,
+            human_request_id=request_id,
+            dispatch=dispatch,
+            max_steps=max_steps,
+        )
+
+    def resolve_approval_request(
+        self,
+        *,
+        workflow_run_id: str,
+        request_id: str,
+        approved: bool,
+        dispatch: bool = True,
+        max_steps: int = 8,
+    ) -> dict[str, Any]:
+        return self._enqueue_job(
+            action="resolve_approval",
+            request="approve" if approved else "reject",
+            workflow_run_id=workflow_run_id,
+            approval_request_id=request_id,
+            approved=approved,
+            dispatch=dispatch,
+            max_steps=max_steps,
+        )
+
+    def _enqueue_job(
+        self,
+        *,
+        action: str,
+        request: str,
+        dispatch: bool,
+        max_steps: int,
+        workflow_run_id: str | None = None,
+        human_request_id: str | None = None,
+        approval_request_id: str | None = None,
+        approved: bool | None = None,
+    ) -> dict[str, Any]:
         job = MonitoringJob(
             id=generate_id("job"),
+            action=action,
             request=request,
             dispatch=dispatch,
             max_steps=max_steps,
+            workflow_run_id=workflow_run_id,
+            human_request_id=human_request_id,
+            approval_request_id=approval_request_id,
+            approved=approved,
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -193,13 +310,39 @@ class MonitoringService:
         with self._lock:
             job = self._jobs[job_id]
             job.status = "running"
+            action = job.action
             request = job.request
             dispatch = job.dispatch
             max_steps = job.max_steps
+            workflow_run_id = job.workflow_run_id
+            human_request_id = job.human_request_id
+            approval_request_id = job.approval_request_id
+            approved = job.approved
 
         try:
-            with self._runtime_factory(root=self.root, environ=self.environ) as runtime:
-                report = runtime.run_workflow(request=request, dispatch=dispatch, max_steps=max_steps)
+            with self._runtime(workflow_run_id=workflow_run_id) as runtime:
+                if action == "start":
+                    report = runtime.run_workflow(request=request, dispatch=dispatch, max_steps=max_steps)
+                elif action == "answer_human":
+                    report = runtime.answer_human_request(
+                        workflow_run_id=workflow_run_id or "",
+                        request_id=human_request_id or "",
+                        answer_text=request,
+                        answered_by="operator",
+                        dispatch=dispatch,
+                        max_steps=max_steps,
+                    )
+                elif action == "resolve_approval":
+                    report = runtime.resolve_approval_request(
+                        workflow_run_id=workflow_run_id or "",
+                        request_id=approval_request_id or "",
+                        approved=bool(approved),
+                        resolved_by="operator",
+                        dispatch=dispatch,
+                        max_steps=max_steps,
+                    )
+                else:  # pragma: no cover - defensive guard
+                    raise ValueError(f"unknown monitoring action {action!r}")
             with self._lock:
                 job = self._jobs[job_id]
                 job.report = report
@@ -235,6 +378,8 @@ class MonitoringService:
             template.key: template
             for template in runtime.workflow_definition.task_templates
         }
+        manager_plan = self._manager_plan(runtime=runtime, tasks=tasks, artifacts=artifacts)
+        manager_summary = self._manager_summary(runtime=runtime, tasks=tasks, artifacts=artifacts)
         latest_attempt_by_task_id: dict[str, TaskAttemptRecord] = {}
         for attempt in attempts:
             current = latest_attempt_by_task_id.get(attempt.task_id)
@@ -376,8 +521,8 @@ class MonitoringService:
             "ended_at": _iso(workflow_run.ended_at),
             "root_input_json": workflow_run.root_input_json,
             "workflow_request": workflow_run.root_input_json.get("user_request"),
-            "manager_plan": self._manager_plan(runtime=runtime, tasks=tasks, artifacts=artifacts),
-            "manager_summary": self._manager_summary(runtime=runtime, tasks=tasks, artifacts=artifacts),
+            "manager_plan": manager_plan,
+            "manager_summary": manager_summary,
             "run_steps": run_steps,
             "tasks": task_payloads,
             "attempts": attempts_payload,
@@ -385,7 +530,77 @@ class MonitoringService:
             "human_requests": human_payloads,
             "approval_requests": approval_payloads,
             "events": event_payloads,
+            "chat_messages": self._chat_messages(
+                workflow_run=workflow_run,
+                manager_plan=manager_plan,
+                manager_summary=manager_summary,
+                human_requests=human_payloads,
+                approval_requests=approval_payloads,
+                run_steps=run_steps,
+            ),
         }
+
+    def _chat_messages(
+        self,
+        *,
+        workflow_run: WorkflowRunRecord,
+        manager_plan: str | None,
+        manager_summary: str | None,
+        human_requests: list[dict[str, Any]],
+        approval_requests: list[dict[str, Any]],
+        run_steps: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        user_request = str(workflow_run.root_input_json.get("user_request", "")).strip()
+        if user_request:
+            messages.append({"id": f"{workflow_run.id}:user", "role": "user", "kind": "request", "text": user_request})
+        if manager_plan:
+            messages.append({"id": f"{workflow_run.id}:plan", "role": "manager", "kind": "plan", "text": manager_plan})
+        if manager_summary and manager_summary != manager_plan:
+            messages.append({"id": f"{workflow_run.id}:summary", "role": "manager", "kind": "summary", "text": manager_summary})
+        for request in human_requests:
+            messages.append(
+                {
+                    "id": request["id"],
+                    "role": "manager",
+                    "kind": "human_request",
+                    "text": request["question"],
+                    "status": request["status"],
+                    "answer_text": request["answer_text"],
+                }
+            )
+            if request["answer_text"]:
+                messages.append(
+                    {
+                        "id": f"{request['id']}:answer",
+                        "role": "user",
+                        "kind": "human_answer",
+                        "text": request["answer_text"],
+                        "status": request["status"],
+                    }
+                )
+        for request in approval_requests:
+            messages.append(
+                {
+                    "id": request["id"],
+                    "role": "system",
+                    "kind": "approval_request",
+                    "text": request["reason"],
+                    "status": request["status"],
+                }
+            )
+        for step in run_steps:
+            messages.append(
+                {
+                    "id": f"{workflow_run.id}:step:{step['index']}",
+                    "role": "system",
+                    "kind": "step",
+                    "text": f"{step['task_key']} -> {step['state']}",
+                    "status": step["state"],
+                    "task_key": step["task_key"],
+                }
+            )
+        return messages
 
     def _manager_plan(
         self,

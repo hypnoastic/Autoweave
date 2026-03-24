@@ -57,21 +57,39 @@ python3 -m apps.cli.main ui --root .
 
 ## Monitoring UI
 
-Launch the lightweight local dashboard:
+Launch the lightweight operator console:
 
 ```bash
 python3 -m apps.cli.main ui --root . --host 127.0.0.1 --port 8765
 ```
 
-The dashboard lets you:
+The operator console lets you:
 
-- submit a user request into the current workflow
-- inspect the current workflow blueprint and task dependencies
-- see recent workflow runs from canonical storage
-- monitor task states, attempts, models, and workspace paths
-- inspect artifacts, human blockers, approval blockers, and recent events
+- chat with the manager-facing entrypoint to start a new run
+- answer open human clarification requests inside the same run
+- approve or reject approval-gated tasks without leaving the run
+- inspect grouped workflow runs from canonical storage instead of a flat dump
+- monitor task states, attempts, models, workspaces, artifacts, blockers, and events
+- expand or collapse detailed run views progressively while keeping the main chat thread readable
 
 The UI is intentionally lightweight and local. It is an operator/debugging surface over canonical AutoWeave state, not a second orchestrator and not a product UI.
+
+## Agents, workflows, and autonomy
+
+AutoWeave uses three project-owned inputs:
+
+- `agents/<role>/autoweave.yaml`: canonical agent metadata such as tool groups, model hints, approval policy, and human interaction policy
+- `agents/<role>/soul.md` and `agents/<role>/playbook.yaml`: role guidance and execution goals
+- `configs/workflows/*.workflow.yaml`: canonical workflow DAG, dependencies, artifact contracts, and approval requirements
+
+The local runtime now loads agent definitions into the real dispatch path. That means:
+
+- model-profile hints influence routing
+- allowed tool groups constrain the OpenHands launch payload
+- task-template approval requirements create real approval blockers before dispatch
+- answered human requests and resolved approvals resume the same canonical workflow run instead of starting over
+
+Set `AUTOWEAVE_DEFAULT_WORKFLOW` in `.env.local` if you want the CLI and operator console to load a workflow other than `configs/workflows/team.workflow.yaml`.
 
 ## Tests
 
@@ -121,7 +139,7 @@ Then bootstrap and run the installed CLI:
 /tmp/autoweave-demo-venv/bin/autoweave bootstrap --root /tmp/autoweave-demo-project
 /tmp/autoweave-demo-venv/bin/autoweave validate --root /tmp/autoweave-demo-project
 /tmp/autoweave-demo-venv/bin/autoweave doctor --root /tmp/autoweave-demo-project
-/tmp/autoweave-demo-venv/bin/autoweave run-example --root /tmp/autoweave-demo-project --dispatch
+/tmp/autoweave-demo-venv/bin/autoweave run-workflow --root /tmp/autoweave-demo-project --request "Build a small clothing ecommerce storefront with a homepage, category grid, product detail page, cart handoff, and Stripe checkout." --dispatch --max-steps 6
 /tmp/autoweave-demo-venv/bin/autoweave ui --root /tmp/autoweave-demo-project
 ```
 
