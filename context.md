@@ -194,6 +194,39 @@ Current implementation only partially satisfies the prompt where live infrastruc
 - Extend the OpenHands integration from conversation bootstrap to full run lifecycle management, event streaming, artifact/result harvesting, and authoritative attempt finalization.
 - Add credential-backed integration coverage that exercises real Vertex model execution and persistent state updates once the next implementation slice is authorized.
 
+## Gap analysis: 2026-03-24 operator-console screenshot repair pass
+
+- The live operator console is rendering canonical data, but the presentation is still misleading in failure and stalled-run cases.
+- The attached screenshot shows a run with `manager_plan` blocked after `conversation poll timed out after 90.0s`, while the top-level run badge still says `running`. That is technically the canonical workflow status, but it is not useful operator-facing state.
+- The right-hand task table is too narrow for long task states like `waiting_for_dependency`, so the most important state information is clipped or visually noisy.
+- The center chat pane is treating replay/failure text as though it were a valid manager plan. When the manager attempt times out before producing a real workflow plan, the UI should surface that as a manager failure or missing plan, not as the plan itself.
+- The current console lacks a derived run-health summary such as `blocked`, `waiting`, `active`, or `stalled`, so a human operator cannot quickly tell whether work is progressing or only persisting in canonical `running` state with no active attempts.
+- This pass should keep the orchestrator authority unchanged, but improve the monitoring payload and UI so:
+  - canonical workflow status remains visible
+  - operator-facing derived status is computed from tasks, attempts, approvals, and human blockers
+  - failed manager output is separated from a real workflow plan
+  - task state rendering becomes readable on standard laptop widths
+
+## Screenshot repair implementation update: 2026-03-24
+
+- Added derived operator-facing run fields in the monitoring payload:
+  - `operator_status`
+  - `operator_summary`
+  - task/attempt state counts
+  - ready/blocked task lists
+  - manager task/attempt state
+  - manager outcome separate from manager plan
+- The monitor now distinguishes a canonical workflow that is still marked `running` from an operator-facing run that is effectively `blocked`, `waiting`, or `stalled`.
+- Manager timeout text is no longer treated as the workflow plan. If a `workflow_plan` artifact was never published, the UI now says so explicitly and shows the timeout/failure text as the manager execution note instead.
+- The right-hand task details were redesigned around task cards instead of a narrow table so long task states like `waiting_for_dependency` stay readable on laptop-width layouts.
+- The console layout now collapses the details column below the chat at a wider breakpoint, which avoids the clipped state badges visible in the screenshot.
+- Monitoring snapshots now refresh asynchronously with a cached response path. This prevents `/api/state` from stalling the whole page while waiting on slower live Postgres/Neo4j-backed reads.
+- Live validation after the patch:
+  - `GET /api/state` now returns immediately with a loading snapshot while refresh is in flight
+  - subsequent polls returned live cached data with `operator_status=blocked` and `operator_summary=blocked by manager_plan` for the screenshot-like stalled run
+- Remaining caveat:
+  - the remote state refresh can still take noticeable time depending on external service latency, but the UI no longer hangs on that path; it serves a quick placeholder snapshot and then swaps in cached live data
+
 ## Gap analysis: 2026-03-20 durable infrastructure pass
 
 Already implemented:

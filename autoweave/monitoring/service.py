@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 import yaml
 
 from autoweave.compiler.loader import CanonicalConfigLoader
@@ -100,6 +101,8 @@ class MonitoringService:
         self._runtime_factory = runtime_factory
         self._jobs: dict[str, MonitoringJob] = {}
         self._lock = Lock()
+        self._snapshot_cache: dict[str, Any] | None = None
+        self._snapshot_refreshing = False
 
     def _runtime(self, *, workflow_run_id: str | None = None):
         kwargs: dict[str, Any] = {
@@ -176,6 +179,41 @@ class MonitoringService:
         return agents
 
     def snapshot(self, *, limit: int = 5) -> dict[str, Any]:
+        refresh_thread = self._ensure_snapshot_refresh(limit=limit)
+        if refresh_thread is not None:
+            refresh_thread.join(timeout=0.25)
+        with self._lock:
+            cached = copy.deepcopy(self._snapshot_cache)
+            refreshing = self._snapshot_refreshing
+        if cached is not None:
+            cached["refreshing"] = refreshing
+            return cached
+        base_payload = self._snapshot_base_payload()
+        base_payload.update(
+            {
+                "status": "loading",
+                "load_error": "Loading live workflow state…",
+                "refreshing": refreshing,
+            }
+        )
+        return base_payload
+
+    def _ensure_snapshot_refresh(self, *, limit: int) -> Thread | None:
+        with self._lock:
+            if self._snapshot_refreshing:
+                return None
+            self._snapshot_refreshing = True
+        thread = Thread(target=self._refresh_snapshot, kwargs={"limit": limit}, daemon=True)
+        thread.start()
+        return thread
+
+    def _refresh_snapshot(self, *, limit: int) -> None:
+        payload = self._compute_snapshot(limit=limit)
+        with self._lock:
+            self._snapshot_cache = payload
+            self._snapshot_refreshing = False
+
+    def _snapshot_base_payload(self) -> dict[str, Any]:
         base_payload = {
             "status": "ok",
             "load_error": None,
@@ -187,6 +225,10 @@ class MonitoringService:
             "selected_run_id": None,
             "selected_run": None,
         }
+        return base_payload
+
+    def _compute_snapshot(self, *, limit: int = 5) -> dict[str, Any]:
+        base_payload = self._snapshot_base_payload()
         base_errors: list[str] = []
         try:
             base_payload["agents"] = self.agent_catalog()
@@ -378,13 +420,25 @@ class MonitoringService:
             template.key: template
             for template in runtime.workflow_definition.task_templates
         }
-        manager_plan = self._manager_plan(runtime=runtime, tasks=tasks, artifacts=artifacts)
-        manager_summary = self._manager_summary(runtime=runtime, tasks=tasks, artifacts=artifacts)
         latest_attempt_by_task_id: dict[str, TaskAttemptRecord] = {}
         for attempt in attempts:
             current = latest_attempt_by_task_id.get(attempt.task_id)
             if current is None or attempt.attempt_number >= current.attempt_number:
                 latest_attempt_by_task_id[attempt.task_id] = attempt
+
+        manager_task = self._manager_task(tasks=tasks)
+        manager_latest_attempt = (
+            latest_attempt_by_task_id.get(manager_task.id)
+            if manager_task is not None
+            else None
+        )
+        manager_plan = self._manager_plan(runtime=runtime, tasks=tasks, artifacts=artifacts)
+        manager_summary = self._manager_summary(runtime=runtime, tasks=tasks, artifacts=artifacts)
+        manager_outcome = self._manager_outcome(
+            manager_task=manager_task,
+            latest_attempt=manager_latest_attempt,
+            summary=manager_summary,
+        )
 
         grouped_artifacts: dict[str, list[ArtifactRecord]] = {}
         for artifact in artifacts:
@@ -407,6 +461,8 @@ class MonitoringService:
                     "description": task.description,
                     "required_artifact_types": list(task.required_artifact_types_json),
                     "produced_artifact_types": list(task.produced_artifact_types_json),
+                    "hard_dependencies": list(getattr(template, "hard_dependencies", [])) if template is not None else [],
+                    "soft_dependencies": list(getattr(template, "soft_dependencies", [])) if template is not None else [],
                     "route_hints": list(getattr(template, "route_hints", [])) if template is not None else [],
                     "latest_attempt_id": latest_attempt.id if latest_attempt else None,
                     "latest_attempt_state": latest_attempt.state.value if latest_attempt else None,
@@ -512,17 +568,45 @@ class MonitoringService:
             }
             for event in events[-15:]
         ]
+        task_state_counts = _count_states(task["state"] for task in task_payloads)
+        attempt_state_counts = _count_states(attempt["state"] for attempt in attempts_payload)
+        ready_task_keys = tuple(task["task_key"] for task in task_payloads if task["state"] == "ready")
+        blocked_task_keys = tuple(task["task_key"] for task in task_payloads if task["state"] == "blocked")
+        failed_task_keys = tuple(task["task_key"] for task in task_payloads if task["state"] == "failed")
+        operator_status, operator_summary = self._derive_operator_status(
+            workflow_status=workflow_run.status.value,
+            task_payloads=task_payloads,
+            human_requests=human_payloads,
+            approval_requests=approval_payloads,
+            attempts_payload=attempts_payload,
+        )
+        run_title = str(workflow_run.root_input_json.get("user_request", "")).strip() or workflow_run.id
 
         return {
             "id": workflow_run.id,
+            "title": run_title,
             "status": workflow_run.status.value,
+            "operator_status": operator_status,
+            "operator_summary": operator_summary,
             "graph_revision": workflow_run.graph_revision,
             "started_at": _iso(workflow_run.started_at),
             "ended_at": _iso(workflow_run.ended_at),
             "root_input_json": workflow_run.root_input_json,
             "workflow_request": workflow_run.root_input_json.get("user_request"),
+            "ready_task_keys": ready_task_keys,
+            "blocked_task_keys": blocked_task_keys,
+            "failed_task_keys": failed_task_keys,
+            "task_state_counts": task_state_counts,
+            "attempt_state_counts": attempt_state_counts,
             "manager_plan": manager_plan,
             "manager_summary": manager_summary,
+            "manager_outcome": manager_outcome,
+            "manager_task_state": manager_task.state.value if manager_task is not None else None,
+            "manager_attempt_state": (
+                manager_latest_attempt.state.value
+                if manager_latest_attempt is not None
+                else None
+            ),
             "run_steps": run_steps,
             "tasks": task_payloads,
             "attempts": attempts_payload,
@@ -534,6 +618,7 @@ class MonitoringService:
                 workflow_run=workflow_run,
                 manager_plan=manager_plan,
                 manager_summary=manager_summary,
+                manager_outcome=manager_outcome,
                 human_requests=human_payloads,
                 approval_requests=approval_payloads,
                 run_steps=run_steps,
@@ -546,6 +631,7 @@ class MonitoringService:
         workflow_run: WorkflowRunRecord,
         manager_plan: str | None,
         manager_summary: str | None,
+        manager_outcome: str | None,
         human_requests: list[dict[str, Any]],
         approval_requests: list[dict[str, Any]],
         run_steps: list[dict[str, Any]],
@@ -556,6 +642,16 @@ class MonitoringService:
             messages.append({"id": f"{workflow_run.id}:user", "role": "user", "kind": "request", "text": user_request})
         if manager_plan:
             messages.append({"id": f"{workflow_run.id}:plan", "role": "manager", "kind": "plan", "text": manager_plan})
+        elif manager_outcome:
+            messages.append(
+                {
+                    "id": f"{workflow_run.id}:manager_outcome",
+                    "role": "manager",
+                    "kind": "execution_note",
+                    "text": manager_outcome,
+                    "status": "warning",
+                }
+            )
         if manager_summary and manager_summary != manager_plan:
             messages.append({"id": f"{workflow_run.id}:summary", "role": "manager", "kind": "summary", "text": manager_summary})
         for request in human_requests:
@@ -602,6 +698,13 @@ class MonitoringService:
             )
         return messages
 
+    def _manager_task(self, *, tasks: list[TaskRecord]) -> TaskRecord | None:
+        manager_tasks = [task for task in tasks if task.assigned_role == "manager" or task.task_key == "manager_plan"]
+        if not manager_tasks:
+            return None
+        manager_tasks.sort(key=lambda item: (item.task_key != "manager_plan", item.id))
+        return manager_tasks[0]
+
     def _manager_plan(
         self,
         *,
@@ -612,19 +715,17 @@ class MonitoringService:
         manager_task_ids = {task.id for task in tasks if task.assigned_role == "manager" or task.task_key == "manager_plan"}
         manager_tasks = [task for task in tasks if task.id in manager_task_ids]
         for task in manager_tasks:
+            if task.state.value != "completed":
+                continue
             if task.output_json:
                 plan_text = _short_json(task.output_json)
                 if plan_text != "none":
                     return plan_text
-            if task.input_json:
-                prompt_text = _short_json(task.input_json)
-                if prompt_text != "none":
-                    return prompt_text
 
         manager_artifacts = [
             artifact
             for artifact in artifacts
-            if artifact.task_id in manager_task_ids and artifact.artifact_type in {"workflow_plan", "openhands_replay"}
+            if artifact.task_id in manager_task_ids and artifact.artifact_type == "workflow_plan"
         ]
         if not manager_artifacts:
             return None
@@ -639,7 +740,7 @@ class MonitoringService:
             if isinstance(payload, dict):
                 return _short_json(payload)
             return str(payload)
-        return self._manager_summary(runtime=runtime, tasks=tasks, artifacts=artifacts)
+        return None
 
     def _manager_summary(
         self,
@@ -682,6 +783,74 @@ class MonitoringService:
                 return messages[-1]
         return artifact.summary
 
+    def _manager_outcome(
+        self,
+        *,
+        manager_task: TaskRecord | None,
+        latest_attempt: TaskAttemptRecord | None,
+        summary: str | None,
+    ) -> str | None:
+        if manager_task is None:
+            return None
+        if manager_task.state.value == "completed":
+            return summary
+        if manager_task.block_reason:
+            return manager_task.block_reason
+        if manager_task.output_json:
+            output_text = _short_json(manager_task.output_json)
+            if output_text != "none":
+                return output_text
+        if summary:
+            return summary
+        if latest_attempt is not None:
+            return f"latest attempt ended as {latest_attempt.state.value}"
+        return None
+
+    def _derive_operator_status(
+        self,
+        *,
+        workflow_status: str,
+        task_payloads: list[dict[str, Any]],
+        human_requests: list[dict[str, Any]],
+        approval_requests: list[dict[str, Any]],
+        attempts_payload: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        open_human = [item for item in human_requests if item["status"] == "open"]
+        open_approval = [item for item in approval_requests if item["status"] == "requested"]
+        active_attempts = [
+            attempt
+            for attempt in attempts_payload
+            if attempt["state"] in {"queued", "dispatching", "running", "paused", "needs_input"}
+        ]
+        blocked_tasks = [task for task in task_payloads if task["state"] == "blocked"]
+        failed_tasks = [task for task in task_payloads if task["state"] == "failed"]
+        ready_tasks = [task for task in task_payloads if task["state"] == "ready"]
+        waiting_dependency = [task for task in task_payloads if task["state"] == "waiting_for_dependency"]
+
+        if workflow_status in {"completed", "failed"}:
+            if workflow_status == "failed" and failed_tasks:
+                return "failed", f"{len(failed_tasks)} task(s) failed"
+            return workflow_status, f"workflow is {workflow_status}"
+        if open_human:
+            return "waiting_for_human", f"waiting on {len(open_human)} human answer(s)"
+        if open_approval:
+            return "waiting_for_approval", f"waiting on {len(open_approval)} approval request(s)"
+        if active_attempts:
+            return "active", f"{len(active_attempts)} active attempt(s)"
+        if failed_tasks:
+            return "failed", f"{len(failed_tasks)} failed task(s)"
+        if blocked_tasks:
+            blocked = ", ".join(task["task_key"] for task in blocked_tasks[:3])
+            suffix = "..." if len(blocked_tasks) > 3 else ""
+            return "blocked", f"blocked by {blocked}{suffix}"
+        if ready_tasks:
+            ready = ", ".join(task["task_key"] for task in ready_tasks[:3])
+            suffix = "..." if len(ready_tasks) > 3 else ""
+            return "ready", f"ready to dispatch: {ready}{suffix}"
+        if waiting_dependency:
+            return "waiting_for_dependency", f"{len(waiting_dependency)} task(s) waiting on dependencies"
+        return "stalled", "no active attempts and no runnable tasks"
+
 
 def _read_text(path: Path) -> str:
     if not path.exists():
@@ -696,3 +865,11 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
     if isinstance(loaded, dict):
         return loaded
     return {}
+
+
+def _count_states(values: Iterable[str | None]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = str(value or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts

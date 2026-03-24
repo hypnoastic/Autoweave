@@ -9,13 +9,25 @@ import httpx
 
 from apps.cli.bootstrap import bootstrap_repository
 from autoweave.local_runtime import LocalWorkflowRunReport
-from autoweave.models import ArtifactRecord, ArtifactStatus, EventRecord, HumanRequestRecord, HumanRequestStatus, HumanRequestType, TaskAttemptRecord, TaskRecord, TaskState, WorkflowRunRecord, WorkflowRunStatus
+from autoweave.models import ArtifactRecord, ArtifactStatus, AttemptState, EventRecord, HumanRequestRecord, HumanRequestStatus, HumanRequestType, TaskAttemptRecord, TaskRecord, TaskState, WorkflowRunRecord, WorkflowRunStatus
 from autoweave.monitoring.service import MonitoringService
 from autoweave.monitoring.web import MonitoringDashboardApp
 
 
 class _FakeArtifactStore:
     def read_manifest(self, artifact_id: str) -> dict[str, object]:
+        if artifact_id == "artifact_plan":
+            return {
+                "payload": {
+                    "plan": [
+                        "backend_contract",
+                        "frontend_ui",
+                        "backend_impl",
+                        "integration",
+                        "review",
+                    ]
+                }
+            }
         return {
             "payload": {
                 "events": [
@@ -43,6 +55,20 @@ class _FakeRepository:
         self._task = task
         self._attempt = attempt
         self._artifact = ArtifactRecord(
+            id="artifact_plan",
+            workflow_run_id=workflow_run.id,
+            task_id=task.id,
+            task_attempt_id=attempt.id,
+            produced_by_role="manager",
+            artifact_type="workflow_plan",
+            title="manager plan",
+            summary="plan published",
+            status=ArtifactStatus.FINAL,
+            version=1,
+            storage_uri="file:///tmp/manager-plan.json",
+            checksum="",
+        )
+        self._replay_artifact = ArtifactRecord(
             workflow_run_id=workflow_run.id,
             task_id=task.id,
             task_attempt_id=attempt.id,
@@ -99,7 +125,7 @@ class _FakeRepository:
 
     def list_artifacts_for_run(self, workflow_run_id: str) -> list[ArtifactRecord]:
         assert workflow_run_id == self._workflow_run.id
-        return [self._artifact]
+        return [self._artifact, self._replay_artifact]
 
     def list_events(self, workflow_run_id: str) -> list[EventRecord]:
         assert workflow_run_id == self._workflow_run.id
@@ -281,13 +307,18 @@ def test_monitoring_service_snapshot_exposes_canonical_state(tmp_path: Path) -> 
     assert payload["runs"][0]["id"] == "run_demo_1"
     assert payload["runs"][0]["graph_revision"] == 1
     assert payload["runs"][0]["workflow_request"] == "Build a boutique storefront"
-    assert payload["runs"][0]["manager_plan"].startswith("{")
+    assert payload["runs"][0]["operator_status"] == "waiting_for_human"
+    assert payload["runs"][0]["operator_summary"] == "waiting on 1 human answer(s)"
+    assert '"backend_contract"' in (payload["runs"][0]["manager_plan"] or "")
+    assert "Backend first, then frontend" in (payload["runs"][0]["manager_summary"] or "")
+    assert '"backend_contract"' in (payload["runs"][0]["manager_outcome"] or "")
     assert payload["runs"][0]["tasks"][0]["task_key"] == "manager_plan"
     assert payload["runs"][0]["tasks"][0]["latest_attempt_state"] == "queued"
     assert payload["runs"][0]["tasks"][0]["input_json"]["user_request"] == "Build a boutique storefront"
     assert payload["runs"][0]["run_steps"][0]["task_key"] == "manager_plan"
     assert payload["runs"][0]["human_requests"][0]["question"] == "Which payment providers should be enabled?"
-    assert "Backend first, then frontend" in (payload["runs"][0]["manager_summary"] or "")
+    assert payload["runs"][0]["task_state_counts"]["waiting_for_human"] == 1
+    assert payload["runs"][0]["attempt_state_counts"]["queued"] == 1
 
 
 def test_monitoring_service_launches_background_workflow_job(tmp_path: Path) -> None:
@@ -324,6 +355,7 @@ def test_monitoring_dashboard_wsgi_app_serves_state_and_launch(tmp_path: Path) -
     assert state.json()["status"] == "ok"
     assert state.json()["selected_run_id"] == "run_demo_1"
     assert state.json()["runs"][0]["id"] == "run_demo_1"
+    assert state.json()["runs"][0]["operator_status"] == "waiting_for_human"
     assert state.json()["agents"][0]["role"] == "backend"
     assert launch.status_code == 202
     assert launch.json()["status"] in {"queued", "running", "completed"}
@@ -410,3 +442,92 @@ def test_monitoring_dashboard_wsgi_app_routes_chat_and_approval_actions(tmp_path
             "max_steps": 1,
         },
     ) in recorder
+
+
+def test_monitoring_service_marks_blocked_runs_and_separates_manager_failure(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+    workflow_run = WorkflowRunRecord(
+        id="run_blocked_1",
+        project_id="local",
+        team_id="local",
+        workflow_definition_id="team:1.0",
+        root_input_json={"user_request": "Build a storefront"},
+        status=WorkflowRunStatus.RUNNING,
+    )
+    task = TaskRecord(
+        id="task_manager",
+        workflow_run_id=workflow_run.id,
+        task_key="manager_plan",
+        title="Manager plan",
+        description="Plan the work.",
+        assigned_role="manager",
+        state=TaskState.BLOCKED,
+        block_reason="conversation poll timed out after 90.0s",
+        input_json={"user_request": "Build a storefront"},
+        produced_artifact_types_json=["workflow_plan"],
+    )
+    attempt = TaskAttemptRecord(
+        id="attempt_manager",
+        task_id=task.id,
+        attempt_number=1,
+        agent_definition_id="manager-agent",
+        workspace_id="attempt_manager",
+        state=AttemptState.ORPHANED,
+        compiled_worker_config_json={
+            "workspace_path": "/workspace/workspaces/attempt_manager",
+            "model_name": "gemini-3-flash-preview",
+        },
+    )
+
+    class _BlockedRepository(_FakeRepository):
+        def __init__(self) -> None:
+            super().__init__(workflow_run, task, attempt)
+
+        def list_artifacts_for_run(self, workflow_run_id: str) -> list[ArtifactRecord]:
+            assert workflow_run_id == self._workflow_run.id
+            return [self._replay_artifact]
+
+        def list_human_requests_for_run(self, workflow_run_id: str) -> list[HumanRequestRecord]:
+            assert workflow_run_id == self._workflow_run.id
+            return []
+
+    class _BlockedRuntime(_FakeRuntime):
+        def __init__(self, root: Path) -> None:
+            self.settings = SimpleNamespace(project_root=root)
+            self.workflow_definition = SimpleNamespace(
+                name="team",
+                version="1.0",
+                entrypoint="manager_plan",
+                roles=["manager"],
+                task_templates=[
+                    SimpleNamespace(
+                        key="manager_plan",
+                        title="Manager plan",
+                        assigned_role="manager",
+                        hard_dependencies=[],
+                        soft_dependencies=[],
+                        produced_artifacts=["workflow_plan"],
+                        required_artifacts=[],
+                    )
+                ],
+            )
+            self.storage = SimpleNamespace(
+                workflow_repository=_BlockedRepository(),
+                artifact_store=_FakeArtifactStore(),
+            )
+
+        def __enter__(self) -> "_BlockedRuntime":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    service = MonitoringService(root=tmp_path, runtime_factory=lambda **kwargs: _BlockedRuntime(tmp_path))
+
+    payload = service.snapshot(limit=3)
+
+    run = payload["runs"][0]
+    assert run["operator_status"] == "blocked"
+    assert "blocked by manager_plan" == run["operator_summary"]
+    assert run["manager_plan"] is None
+    assert run["manager_outcome"] == "conversation poll timed out after 90.0s"

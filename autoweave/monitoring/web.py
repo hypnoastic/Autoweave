@@ -179,7 +179,7 @@ def _render_index() -> str:
     }
     .shell {
       display: grid;
-      grid-template-columns: 320px minmax(0, 1fr) 420px;
+      grid-template-columns: 290px minmax(0, 1fr) 430px;
       gap: 18px;
       padding: 18px;
       min-height: 100vh;
@@ -231,6 +231,7 @@ def _render_index() -> str:
     .pill {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
       border-radius: 999px;
       padding: 4px 10px;
@@ -238,8 +239,12 @@ def _render_index() -> str:
       font-weight: 700;
       background: rgba(138,91,49,0.12);
       color: var(--accent);
+      white-space: normal;
+      line-height: 1.2;
+      text-align: center;
     }
     .pill.ok { background: rgba(31,111,91,0.12); color: var(--accent-2); }
+    .pill.live { background: rgba(53,95,139,0.12); color: var(--accent-3); }
     .pill.warn { background: rgba(163,106,0,0.12); color: var(--warning); }
     .pill.bad { background: rgba(152,46,46,0.12); color: var(--danger); }
     .composer textarea {
@@ -418,6 +423,52 @@ def _render_index() -> str:
       gap: 12px;
       align-content: start;
     }
+    .task-card-grid {
+      display: grid;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .task-card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #fff;
+      padding: 12px 14px;
+      display: grid;
+      gap: 10px;
+    }
+    .task-card-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+    }
+    .state-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .facts {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    }
+    .fact {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel-3);
+      padding: 8px 10px;
+      display: grid;
+      gap: 4px;
+    }
+    .section-note {
+      border: 1px solid rgba(163,106,0,0.25);
+      border-radius: 12px;
+      background: rgba(163,106,0,0.08);
+      color: var(--warning);
+      padding: 10px 12px;
+    }
     details {
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -472,7 +523,7 @@ def _render_index() -> str:
       color: var(--muted);
       background: rgba(255,255,255,0.45);
     }
-    @media (max-width: 1320px) {
+    @media (max-width: 1460px) {
       .shell { grid-template-columns: 300px minmax(0, 1fr); }
       .column.details { grid-column: 1 / -1; }
       .chat-shell { min-height: auto; }
@@ -612,8 +663,9 @@ def _render_index() -> str:
 
     function badgeClass(status) {
       const value = String(status || "").toLowerCase();
-      if (["completed", "succeeded", "running", "ready", "open"].includes(value)) return "pill ok";
-      if (["waiting_for_human", "waiting_for_approval", "blocked", "paused", "needs_input", "requested", "degraded"].includes(value)) return "pill warn";
+      if (["completed", "succeeded", "ready", "open", "approved"].includes(value)) return "pill ok";
+      if (["active", "running", "dispatching", "queued"].includes(value)) return "pill live";
+      if (["waiting_for_human", "waiting_for_approval", "waiting_for_dependency", "blocked", "paused", "needs_input", "requested", "degraded", "stalled", "orphaned"].includes(value)) return "pill warn";
       if (["failed", "errored", "error", "rejected", "aborted", "orphaned"].includes(value)) return "pill bad";
       return "pill";
     }
@@ -622,7 +674,10 @@ def _render_index() -> str:
       nodes.projectRoot.textContent = snapshot.project_root || "unknown";
       nodes.statusPill.textContent = snapshot.status || "ok";
       nodes.statusPill.className = badgeClass(snapshot.status || "ok");
-      if (snapshot.load_error) {
+      if (snapshot.status === "loading") {
+        nodes.stateBanner.className = "banner active warn";
+        nodes.stateBanner.textContent = snapshot.load_error || "Loading live workflow state…";
+      } else if (snapshot.load_error) {
         nodes.stateBanner.className = "banner active error";
         nodes.stateBanner.textContent = snapshot.load_error;
       } else if ((snapshot.jobs || []).some((job) => job.status === "error")) {
@@ -677,10 +732,10 @@ def _render_index() -> str:
     function groupRuns(runs) {
       const groups = { active: [], waiting: [], completed: [], failed: [] };
       for (const run of runs) {
-        const status = String(run.status || "").toLowerCase();
+        const status = String(run.operator_status || run.status || "").toLowerCase();
         if (["completed", "succeeded"].includes(status)) groups.completed.push(run);
         else if (["failed", "errored"].includes(status)) groups.failed.push(run);
-        else if (["waiting_for_human", "waiting_for_approval", "blocked"].includes(status) || (run.human_requests || []).some((item) => item.status === "open") || (run.approval_requests || []).some((item) => item.status === "requested")) groups.waiting.push(run);
+        else if (["waiting_for_human", "waiting_for_approval", "blocked", "stalled", "waiting_for_dependency"].includes(status) || (run.human_requests || []).some((item) => item.status === "open") || (run.approval_requests || []).some((item) => item.status === "requested")) groups.waiting.push(run);
         else groups.active.push(run);
       }
       return groups;
@@ -689,6 +744,7 @@ def _render_index() -> str:
     function runSummaryText(run) {
       const humanCount = (run.human_requests || []).filter((item) => item.status === "open").length;
       const approvalCount = (run.approval_requests || []).filter((item) => item.status === "requested").length;
+      if (run.operator_summary) return run.operator_summary;
       if (humanCount || approvalCount) return `${humanCount} human · ${approvalCount} approval`;
       return `${(run.tasks || []).length} tasks · ${(run.artifacts || []).length} artifacts`;
     }
@@ -724,11 +780,12 @@ def _render_index() -> str:
               ${items.map((run) => `
               <button class="list-item ${state.selectedRunId === run.id ? "selected" : ""}" data-run-id="${escapeHtml(run.id)}">
                 <div class="list-title">
-                  <strong>${escapeHtml(run.workflow_request || run.id)}</strong>
-                  <span class="${badgeClass(run.status)}">${escapeHtml(run.status)}</span>
+                  <strong>${escapeHtml(run.title || run.workflow_request || run.id)}</strong>
+                  <span class="${badgeClass(run.operator_status || run.status)}">${escapeHtml(run.operator_status || run.status)}</span>
                 </div>
                 <div class="muted mono">${escapeHtml(run.id)}</div>
                 <div class="muted">${escapeHtml(runSummaryText(run))}</div>
+                <div class="muted">workflow: ${escapeHtml(run.status || "unknown")}</div>
               </button>
               `).join("")}
             </div>
@@ -787,10 +844,12 @@ def _render_index() -> str:
 
       const openHuman = (run.human_requests || []).find((item) => item.status === "open") || null;
       const openApproval = (run.approval_requests || []).find((item) => item.status === "requested") || null;
-      nodes.chatTitle.textContent = run.workflow_request || run.id;
+      const operatorStatus = run.operator_status || run.status || "unknown";
+      nodes.chatTitle.textContent = run.title || run.workflow_request || run.id;
       nodes.chatSubtitle.textContent = run.id;
       nodes.chatSummary.innerHTML = `
-        <span class="${badgeClass(run.status)}">${escapeHtml(run.status)}</span>
+        <span class="${badgeClass(operatorStatus)}">${escapeHtml(operatorStatus)}</span>
+        <span class="pill">workflow ${escapeHtml(run.status || "unknown")}</span>
         <span class="pill">${escapeHtml(`${(run.tasks || []).length} tasks`)}</span>
         <span class="pill">${escapeHtml(`${(run.attempts || []).length} attempts`)}</span>
         <span class="pill">${escapeHtml(`${(run.artifacts || []).length} artifacts`)}</span>
@@ -820,14 +879,39 @@ def _render_index() -> str:
           `).join("")
         : '<div class="empty">No chat messages recorded yet for this run.</div>';
 
-      const taskRows = (run.tasks || []).map((task) => `
-        <tr>
-          <td><code>${escapeHtml(task.task_key)}</code></td>
-          <td>${escapeHtml(task.assigned_role)}</td>
-          <td><span class="${badgeClass(task.state)}">${escapeHtml(task.state)}</span></td>
-          <td>${escapeHtml(task.latest_attempt_state || "none")}</td>
-          <td>${escapeHtml(task.block_reason || "none")}</td>
-        </tr>
+      const taskCards = (run.tasks || []).map((task) => `
+        <div class="task-card">
+          <div class="task-card-header">
+            <div>
+              <strong><code>${escapeHtml(task.task_key)}</code></strong>
+              <div class="muted">${escapeHtml(task.assigned_role)}</div>
+            </div>
+            <div class="state-row">
+              <span class="${badgeClass(task.state)}">${escapeHtml(task.state)}</span>
+              ${task.latest_attempt_state ? `<span class="${badgeClass(task.latest_attempt_state)}">${escapeHtml(task.latest_attempt_state)}</span>` : ""}
+            </div>
+          </div>
+          ${task.description ? `<div>${escapeHtml(task.description)}</div>` : ""}
+          ${task.block_reason ? `<div class="section-note">Blocked: ${escapeHtml(task.block_reason)}</div>` : ""}
+          <div class="facts">
+            <div class="fact">
+              <div class="muted">Hard deps</div>
+              <div>${escapeHtml((task.hard_dependencies || []).join(", ") || "none")}</div>
+            </div>
+            <div class="fact">
+              <div class="muted">Route hints</div>
+              <div>${escapeHtml((task.route_hints || []).join(", ") || "none")}</div>
+            </div>
+            <div class="fact">
+              <div class="muted">Model</div>
+              <div>${escapeHtml(task.model_name || "n/a")}</div>
+            </div>
+            <div class="fact">
+              <div class="muted">Workspace</div>
+              <div><code>${escapeHtml(task.workspace_path || task.workspace_id || "n/a")}</code></div>
+            </div>
+          </div>
+        </div>
       `).join("");
       const attemptRows = (run.attempts || []).map((attempt) => `
         <tr>
@@ -859,23 +943,32 @@ def _render_index() -> str:
 
       nodes.runDetails.innerHTML = `
         <div class="detail-grid">
+          <div class="mini-card"><div class="muted">Operator status</div><strong>${escapeHtml(operatorStatus)}</strong></div>
           <div class="mini-card"><div class="muted">Workflow status</div><strong>${escapeHtml(run.status)}</strong></div>
           <div class="mini-card"><div class="muted">Open human requests</div><strong>${escapeHtml(String((run.human_requests || []).filter((item) => item.status === "open").length))}</strong></div>
           <div class="mini-card"><div class="muted">Open approvals</div><strong>${escapeHtml(String((run.approval_requests || []).filter((item) => item.status === "requested").length))}</strong></div>
+          <div class="mini-card"><div class="muted">Active attempts</div><strong>${escapeHtml(String((run.attempt_state_counts && (run.attempt_state_counts.running || 0) + (run.attempt_state_counts.dispatching || 0) + (run.attempt_state_counts.queued || 0) + (run.attempt_state_counts.paused || 0) + (run.attempt_state_counts.needs_input || 0)) || 0))}</strong></div>
+          <div class="mini-card"><div class="muted">Ready tasks</div><strong>${escapeHtml(String((run.ready_task_keys || []).length))}</strong></div>
+          <div class="mini-card"><div class="muted">Blocked tasks</div><strong>${escapeHtml(String((run.blocked_task_keys || []).length))}</strong></div>
           <div class="mini-card"><div class="muted">Graph revision</div><strong>${escapeHtml(String(run.graph_revision || 1))}</strong></div>
         </div>
         <details open>
-          <summary>Manager plan and summary</summary>
+          <summary>Manager plan and execution</summary>
           <div style="margin-top:10px;">
-            <h4>Plan</h4>
-            ${renderJson(run.manager_plan)}
-            <h4 style="margin-top:10px;">Summary</h4>
-            ${renderJson(run.manager_summary)}
+            ${run.operator_summary ? `<div class="section-note">${escapeHtml(run.operator_summary)}</div>` : ""}
+            <h4 style="margin-top:10px;">Plan</h4>
+            ${run.manager_plan ? renderJson(run.manager_plan) : '<div class="empty">No valid workflow plan artifact has been published yet.</div>'}
+            <h4 style="margin-top:10px;">Execution note</h4>
+            ${renderJson(run.manager_outcome)}
+            <div class="detail-grid">
+              <div class="mini-card"><div class="muted">Manager task</div><strong>${escapeHtml(run.manager_task_state || "none")}</strong></div>
+              <div class="mini-card"><div class="muted">Manager attempt</div><strong>${escapeHtml(run.manager_attempt_state || "none")}</strong></div>
+            </div>
           </div>
         </details>
         <details open>
           <summary>Tasks</summary>
-          <table><thead><tr><th>Task</th><th>Role</th><th>State</th><th>Attempt</th><th>Blocker</th></tr></thead><tbody>${taskRows || '<tr><td colspan="5">No tasks.</td></tr>'}</tbody></table>
+          <div class="task-card-grid">${taskCards || '<div class="empty">No tasks.</div>'}</div>
         </details>
         <details>
           <summary>Attempts and sandboxes</summary>

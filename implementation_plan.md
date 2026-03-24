@@ -16,6 +16,7 @@
 - M13 is now implemented for separate bundled project templates plus a lightweight monitoring UI for local workflow inspection and launch, without changing the orchestrator boundary or adding a heavy frontend stack.
 - M14 is now implemented for upgrading the packaged demo-agent scaffold and making the monitor practical for live prompting and workflow observation.
 - M15 is now implemented for operator-console hardening, resumable human/approval flow, runtime policy enforcement, and live dispatch coordination; the remaining drift is external OpenHands/Vertex latency during some real downstream runs.
+- M16 is now implemented for screenshot-driven operator-console repair: derive operator-facing run health from canonical state, separate manager failure from manager plan rendering, redesign the details layout for laptop-width readability, and make `/api/state` non-blocking through cached asynchronous refresh.
 
 ## Milestones
 
@@ -171,6 +172,19 @@
   - full `pytest -q` passes with new runtime, monitoring, and coordination coverage
   - live repo-root validation and packaged-install validation both reach the real Dockerized/OpenHands/Vertex stack with exact commands recorded
   - remaining external limitation: some downstream live tasks still hit OpenHands/Vertex timeout or generic worker-error paths, but those now finalize durably and surface clearly to the operator
+
+### M16. Operator-console state semantics and layout repair
+
+- Add derived operator-facing run state in the monitoring payload so the console can distinguish `active`, `waiting`, `blocked`, `stalled`, and `failed` runs without changing canonical workflow status.
+- Add manager outcome fields so missing/failed manager plans are rendered as execution failures or missing plan data instead of being shown as the plan.
+- Replace the narrow task-details table with a clearer card/list layout that keeps task state, attempt state, blockers, dependencies, and model/workspace metadata readable on laptop-sized screens.
+- Tighten run-grouping and chat/detail summaries around derived state rather than only the coarse workflow-run status.
+- Verification result:
+  - screenshot-reproduced blocked/stalled runs no longer appear as if they are actively progressing
+  - manager timeout text is shown as manager failure or execution note, not as the workflow plan
+  - task states such as `waiting_for_dependency` remain readable without clipping
+  - monitor regression tests cover derived status and the updated rendering contract
+  - `/api/state` returns immediately with a cached/loading snapshot while live refresh continues in the background
 
 ## Workstreams and ownership
 
