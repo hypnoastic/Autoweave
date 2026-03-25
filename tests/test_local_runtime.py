@@ -233,6 +233,76 @@ def _recording_transport(calls: list[dict[str, object]]) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _finish_tool_transport(calls: list[dict[str, object]]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: dict[str, object] = {}
+        if request.content:
+            body = json.loads(request.content.decode("utf-8"))
+        calls.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": {key.lower(): value for key, value in request.headers.items()},
+                "body": body,
+            }
+        )
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/api/conversations":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conversation-finish",
+                    "workspace": body.get("workspace", {}),
+                    "agent": body.get("agent", {}),
+                    "execution_status": "running",
+                    "persistence_dir": "workspace/conversations/conversation-finish",
+                },
+            )
+        if request.url.path == "/api/conversations/conversation-finish":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conversation-finish",
+                    "execution_status": "finished",
+                    "persistence_dir": "workspace/conversations/conversation-finish",
+                },
+            )
+        if request.url.path == "/api/conversations/conversation-finish/events/search":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "kind": "ActionEvent",
+                            "tool_name": "finish",
+                            "action": {
+                                "kind": "FinishAction",
+                                "message": "Completed the manager plan for the storefront.",
+                            },
+                        },
+                        {
+                            "kind": "ObservationEvent",
+                            "tool_name": "finish",
+                            "observation": {
+                                "kind": "FinishObservation",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Completed the manager plan for the storefront.",
+                                    }
+                                ],
+                            },
+                        },
+                    ],
+                    "next_page_id": None,
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    return httpx.MockTransport(handler)
+
+
 def test_local_environment_settings_normalize_vertex_credentials(tmp_path: Path) -> None:
     _prepare_local_root(tmp_path)
 
@@ -351,6 +421,23 @@ def test_local_runtime_bootstrap_composes_and_dispatches(tmp_path: Path, monkeyp
     ]
 
 
+def test_local_runtime_treats_finish_tool_events_as_success(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _finish_tool_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        example = runtime.run_example(dispatch=True)
+
+    assert example.task_state == "completed"
+    assert example.attempt_state == "succeeded"
+    assert example.stream_event_types == ("complete",)
+    manifests = [runtime.storage.artifact_store.read_manifest(artifact_id) for artifact_id in example.artifact_ids]
+    assert {manifest["artifact"]["artifact_type"] for manifest in manifests} == {"openhands_replay", "workflow_plan"}
+    assert any(manifest["payload"] == "Completed the manager plan for the storefront." for manifest in manifests)
+
+
 def test_local_runtime_run_workflow_propagates_request_and_advances_multiple_tasks(tmp_path: Path, monkeypatch) -> None:
     _prepare_local_root(tmp_path)
     calls: list[dict[str, object]] = []
@@ -375,6 +462,12 @@ def test_local_runtime_run_workflow_propagates_request_and_advances_multiple_tas
     first_prompt = conversation_calls[0]["body"]["initial_message"]["content"][0]["text"]
     assert "Task Input JSON:" in first_prompt
     assert '"user_request": "Build a small ecommerce website for clothing brands. Ask for clarification if checkout or product constraints are missing."' in first_prompt
+    downstream_prompts = [call["body"]["initial_message"]["content"][0]["text"] for call in conversation_calls[1:]]
+    assert all(
+        '"user_request": "Build a small ecommerce website for clothing brands. Ask for clarification if checkout or product constraints are missing."' in prompt
+        for prompt in downstream_prompts
+    )
+    assert any('"upstream_artifacts"' in prompt for prompt in downstream_prompts)
 
 
 def test_local_runtime_run_workflow_stops_on_human_input_request(tmp_path: Path, monkeypatch) -> None:

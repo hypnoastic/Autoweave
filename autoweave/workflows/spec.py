@@ -100,7 +100,7 @@ def build_workflow_graph(
             title=template.title,
             description=_render_template(template.description_template, root_payload),
             assigned_role=template.assigned_role,
-            input_json=dict(root_payload) if template.key == definition.entrypoint and root_payload else {},
+            input_json=dict(root_payload) if root_payload else {},
             required_artifact_types_json=list(template.required_artifacts),
             produced_artifact_types_json=list(template.produced_artifacts),
         )

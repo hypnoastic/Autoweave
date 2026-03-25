@@ -822,3 +822,67 @@ Current known limitation after this cleanup:
 
 - the first live monitor refresh is still gated by the real Postgres-backed canonical snapshot path, which currently takes roughly 5 to 6 seconds in this environment before cached run data is available
 - the UI no longer lies about that path by showing a fake timeout failure, but it still waits on the backend snapshot before the first fully populated view appears
+
+## Downstream-context runtime repair update: 2026-03-25
+
+Focused debugging plan for this pass:
+
+- verify whether the live OpenHands path is failing because downstream tasks lose canonical request context after the manager step
+- confirm whether terminal OpenHands finish events are being normalized into authoritative AutoWeave task success
+- patch only the runtime/workflow handoff so downstream branches receive the original user request plus orchestrator-scoped upstream artifact context
+- rerun a real live workflow and wait for concrete worker outputs before recording the result
+
+What was broken when this repair slice started:
+
+- the manager step could complete, but downstream workers were often launched with almost no task-specific context beyond the static task title/description
+- `build_workflow_graph(...)` only copied `root_input_json` into the entrypoint task, so downstream tasks often started with empty `input_json`
+- even when upstream tasks completed, downstream launch payloads did not reliably include orchestrator-scoped artifact summaries by default
+- OpenHands finish-tool events could arrive as `ActionEvent` / `ObservationEvent` records instead of a direct terminal message, and the runtime normalized those into generic progress events instead of authoritative task success
+
+What changed in this slice:
+
+- `autoweave/workflows/spec.py` now propagates the canonical `root_input_json` to every instantiated task, not only the entrypoint task
+- `autoweave/local_runtime.py` now prepares a task for dispatch by merging:
+  - canonical workflow request
+  - any task-local `input_json`
+  - scoped upstream artifact summaries from the context service
+  - required and produced artifact type hints
+- `autoweave/local_runtime.py` now persists a fallback final artifact from a successful worker run when the task produced a success summary but no explicit final domain artifact event
+- `autoweave/workers/runtime.py` now normalizes finish-tool `ActionEvent` / `ObservationEvent` payloads into terminal success events so the canonical attempt/task state machine closes correctly
+
+Live validation completed in this slice:
+
+- targeted regression tests passed for workflow propagation and finish-tool normalization
+- a fresh live repo-root workflow run was executed after clearing local runtime state
+- the manager task completed successfully and wrote a real `workflow_plan.md`
+- the frontend and backend-contract tasks were then dispatched with the original clothing-store request plus orchestrator-scoped upstream artifacts
+- the live frontend worker produced on-task boutique storefront files instead of a generic unrelated site:
+  - `index.html`
+  - `product.html`
+  - `styles.css`
+  - `catalog.js`
+  - `app.js`
+- the live backend-contract worker completed successfully and published a canonical contract artifact
+
+Evidence captured from the live run:
+
+- workflow run: `team_1.0_run_demo_396003f8f20a4e5a9e219e74ab3cf56a`
+- completed tasks so far:
+  - `manager_plan`
+  - `frontend_ui`
+  - `backend_contract`
+- produced artifact types so far:
+  - `workflow_plan`
+  - `frontend_ui`
+  - `backend_contract`
+  - OpenHands replay artifacts for each completed conversation
+- the downstream frontend prompt now includes:
+  - original `user_request`
+  - `required_artifact_types`
+  - `produced_artifact_types`
+  - `upstream_artifacts`
+
+Current remaining limitation after this slice:
+
+- the broader multi-step live run is still slower than ideal because later backend/integration/review branches depend on real OpenHands plus Vertex latency
+- the canonical downstream context bug is fixed, but a full end-to-end six-step workflow can still spend minutes waiting on external worker completion

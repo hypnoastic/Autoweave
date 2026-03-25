@@ -91,6 +91,44 @@ def test_cycle_detection_rejects_invalid_workflow_graph() -> None:
         build_workflow_graph(definition, project_id="proj", team_id="team")
 
 
+def test_workflow_graph_propagates_root_input_to_all_tasks() -> None:
+    graph = build_workflow_graph(
+        parse_workflow_definition(
+            dedent(
+                """
+                name: sample
+                version: "1.0"
+                roles: [manager, frontend]
+                stages: [planning, implementation]
+                entrypoint: manager_plan
+                task_templates:
+                  - key: manager_plan
+                    title: Manager plan
+                    assigned_role: manager
+                    description_template: Plan work for {user_request}
+                    hard_dependencies: []
+                  - key: frontend_ui
+                    title: Frontend UI
+                    assigned_role: frontend
+                    description_template: Build the frontend for {user_request}
+                    hard_dependencies: [manager_plan]
+                completion_rules: {}
+                """
+            )
+        ),
+        project_id="proj",
+        team_id="team",
+        root_input_json={"user_request": "build a clothing storefront"},
+    )
+
+    assert {
+        task.task_key: task.input_json for task in graph.tasks
+    } == {
+        "manager_plan": {"user_request": "build a clothing storefront"},
+        "frontend_ui": {"user_request": "build a clothing storefront"},
+    }
+
+
 def test_blocked_branch_does_not_stop_unrelated_branches() -> None:
     service = OrchestrationService(WorkflowRunState.from_graph(example_notifications_workflow_graph()))
     service.schedule()

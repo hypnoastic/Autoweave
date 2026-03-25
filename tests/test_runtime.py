@@ -366,6 +366,29 @@ def test_empty_openhands_message_event_tracks_reasoning_only_payloads() -> None:
     assert stream_event.payload_json["reasoning_content_present"] is True
 
 
+def test_finish_tool_events_are_normalized_to_terminal_completion() -> None:
+    stream_event = normalize_openhands_stream_event(
+        {
+            "kind": "ObservationEvent",
+            "tool_name": "finish",
+            "observation": {
+                "kind": "FinishObservation",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Implementation complete. Wrote the storefront plan and assumptions.",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert stream_event.event_type == "complete"
+    assert stream_event.outcome == "success"
+    assert stream_event.terminal is True
+    assert "Implementation complete" in stream_event.message
+
+
 def test_openhands_vertex_reasoning_defaults_to_none() -> None:
     request = build_openhands_conversation_request(
         {

@@ -376,6 +376,18 @@
 - tests for current-run summaries, task/attempt/artifact rendering, and blocker visibility
 - tests that the monitoring UI can accept a user request and start a workflow through the installed command surface
 
+### M14
+
+- workflow-instantiation fix so canonical `root_input_json` reaches every task, not only the entrypoint
+- runtime dispatch preparation that merges workflow request, task-local input, and orchestrator-scoped upstream artifact summaries before worker launch
+- OpenHands finish-event normalization so finish-tool action/observation payloads finalize canonical attempts/tasks as success
+- success-path fallback artifact publication when a worker finishes with a usable summary but no explicit final domain artifact event
+- live validation against the Dockerized OpenHands/Vertex stack proving:
+  - manager plan completion
+  - downstream parallel dispatch with preserved request context
+  - real boutique storefront frontend output
+  - canonical artifact publication for manager/frontend/backend contract tasks
+
 ## Credential-dependent gates
 
 - Use the existing local env and secret material already present in the workspace rather than inventing new credentials.

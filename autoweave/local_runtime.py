@@ -297,6 +297,41 @@ class LocalRuntime:
     def _workflow_request(self) -> str:
         return str(self.orchestration.state.graph.workflow_run.root_input_json.get("user_request", "")).strip()
 
+    def _upstream_artifact_context(self, task: TaskRecord) -> list[dict[str, object]]:
+        artifacts = self.storage.context_service.get_upstream_artifacts(task_id=task.id)
+        return [
+            {
+                "artifact_id": artifact.id,
+                "artifact_type": artifact.artifact_type,
+                "title": artifact.title,
+                "summary": artifact.summary,
+                "produced_by_role": artifact.produced_by_role,
+                "status": artifact.status.value,
+                "version": artifact.version,
+            }
+            for artifact in artifacts
+        ]
+
+    def _prepare_task_for_dispatch(self, task: TaskRecord) -> TaskRecord:
+        merged_input = dict(self.orchestration.state.graph.workflow_run.root_input_json)
+        merged_input.update(task.input_json)
+        workflow_request = self._workflow_request()
+        if workflow_request and not str(merged_input.get("user_request", "")).strip():
+            merged_input["user_request"] = workflow_request
+        upstream_artifacts = self._upstream_artifact_context(task)
+        if upstream_artifacts:
+            merged_input["upstream_artifacts"] = upstream_artifacts
+        if task.required_artifact_types_json:
+            merged_input["required_artifact_types"] = list(task.required_artifact_types_json)
+        if task.produced_artifact_types_json:
+            merged_input["produced_artifact_types"] = list(task.produced_artifact_types_json)
+        if merged_input == task.input_json:
+            return task
+        updated_task = task.model_copy(update={"input_json": merged_input})
+        self.orchestration.state.update_task(updated_task)
+        self._sync_canonical_state()
+        return self.orchestration.state.task(task.id)
+
     def _approval_policy_requires_pre_dispatch(
         self,
         *,
@@ -698,8 +733,14 @@ class LocalRuntime:
         artifact_ids: list[str] = []
         current_task = task
         current_attempt = attempt
+        latest_message = ""
+        latest_terminal_message = ""
         for stream_event in stream_events:
             emitted_types.append(stream_event.event_type)
+            if stream_event.message.strip():
+                latest_message = stream_event.message.strip()
+            if stream_event.terminal and stream_event.message.strip():
+                latest_terminal_message = stream_event.message.strip()
             self._publish_lifecycle_event(
                 task=current_task,
                 attempt=current_attempt,
@@ -752,7 +793,53 @@ class LocalRuntime:
             outcome = (stream_event.outcome or "").lower()
             terminal = stream_event.terminal or outcome in {"success", "succeeded", "complete", "completed", "failure", "failed", "error", "timeout", "crash", "orphaned"}
             if outcome in {"success", "succeeded", "complete", "completed"} or (stream_event.event_type in {"complete", "completed", "final"} and not outcome):
+                terminal_summary = latest_terminal_message or latest_message or current_task.description
+                current_task = current_task.model_copy(
+                    update={
+                        "output_json": {
+                            **current_task.output_json,
+                            "result_summary": terminal_summary,
+                        }
+                    }
+                )
+                self.orchestration.state.update_task(current_task)
                 current_task, current_attempt = self.orchestration.finalize_attempt_success(current_task.id, current_attempt.id)
+                if not artifact_ids and current_task.produced_artifact_types_json:
+                    fallback_artifact = ArtifactRecord(
+                        workflow_run_id=current_task.workflow_run_id,
+                        task_id=current_task.id,
+                        task_attempt_id=current_attempt.id,
+                        produced_by_role=current_task.assigned_role,
+                        artifact_type=current_task.produced_artifact_types_json[0],
+                        title=current_task.title,
+                        summary=terminal_summary,
+                        status=ArtifactStatus.FINAL,
+                        version=1,
+                        storage_uri="",
+                        checksum="",
+                        metadata_json={
+                            "content_type": "text/plain",
+                            "artifact_source": "terminal_success_fallback",
+                        },
+                    )
+                    stored_artifact = self.storage.artifact_registry.put_artifact(
+                        fallback_artifact,
+                        payload=terminal_summary,
+                    )
+                    artifact_ids.append(stored_artifact.id)
+                    self._publish_lifecycle_event(
+                        task=current_task,
+                        attempt=current_attempt,
+                        event_type="artifact.published",
+                        source="artifacts",
+                        payload_json={
+                            "artifact_id": stored_artifact.id,
+                            "artifact_type": stored_artifact.artifact_type,
+                            "status": stored_artifact.status.value,
+                            "storage_uri": stored_artifact.storage_uri,
+                            "artifact_source": "terminal_success_fallback",
+                        },
+                    )
                 self._sync_canonical_state()
             elif outcome in {"timeout", "crash", "orphaned"}:
                 current_task, current_attempt = self.orchestration.finalize_attempt_failure(
@@ -791,6 +878,7 @@ class LocalRuntime:
         dispatch: bool,
         stream_events: Iterable[Mapping[str, Any] | OpenHandsStreamEvent] | None = None,
     ) -> LocalTaskRunReport:
+        task = self._prepare_task_for_dispatch(task)
         template = self._task_template(task.task_key)
         agent_definition = self.agent_definition(task.assigned_role)
         attempt = self.orchestration.open_attempt(

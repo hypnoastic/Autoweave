@@ -250,6 +250,39 @@ def _normalize_openhands_api_event(payload: dict[str, Any], kind: str) -> OpenHa
             empty_response=empty_response,
         )
     if "observationevent" in kind_lower or "actionevent" in kind_lower or "tokenevent" in kind_lower:
+        tool_name = str(payload.get("tool_name") or "")
+        action_payload = payload.get("action")
+        observation_payload = payload.get("observation")
+        action_kind = (
+            str(action_payload.get("kind") or "")
+            if isinstance(action_payload, Mapping)
+            else ""
+        )
+        observation_kind = (
+            str(observation_payload.get("kind") or "")
+            if isinstance(observation_payload, Mapping)
+            else ""
+        )
+        if tool_name == "finish" or action_kind == "FinishAction" or observation_kind == "FinishObservation":
+            finish_message = ""
+            if isinstance(action_payload, Mapping):
+                finish_message = str(action_payload.get("message") or "")
+            if not finish_message and isinstance(observation_payload, Mapping):
+                finish_message = _message_text(observation_payload.get("content"))
+            if not finish_message:
+                finish_message = str(payload.get("message") or payload.get("content") or "conversation finished")
+            return OpenHandsStreamEvent(
+                event_type="complete",
+                message=finish_message,
+                payload_json={
+                    "kind": kind,
+                    "tool_name": tool_name,
+                    "action_kind": action_kind,
+                    "observation_kind": observation_kind,
+                },
+                outcome="success",
+                terminal=True,
+            )
         return OpenHandsStreamEvent(
             event_type="progress",
             message=str(payload.get("message") or payload.get("content") or payload.get("tool_name") or kind),
