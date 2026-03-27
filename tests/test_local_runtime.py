@@ -837,6 +837,56 @@ def test_local_runtime_promotes_manager_semantic_clarification_to_waiting_for_hu
     assert report.step_reports[0].task_state == "waiting_for_human"
 
 
+def test_local_runtime_ignores_user_echo_when_detecting_manager_semantic_clarification(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.run_workflow(
+            request="Build a modern booking app.",
+            dispatch=True,
+            max_steps=1,
+            stream_events_by_task={
+                "manager_plan": (
+                    {
+                        "kind": "MessageEvent",
+                        "source": "user",
+                        "llm_message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Resolved Clarifications:\n"
+                                        "- What exact thing is being booked? -> Private study rooms.\n"
+                                        "Task Input JSON:\n"
+                                        '{"clarification_answers":{"What exact thing is being booked?":"Private study rooms."}}'
+                                    ),
+                                }
+                            ],
+                            "tool_calls": None,
+                        },
+                    },
+                    {
+                        "kind": "ObservationEvent",
+                        "tool_name": "finish",
+                        "observation": {
+                            "kind": "FinishObservation",
+                            "content": [{"type": "text", "text": "Planned the booking app using the resolved clarification."}],
+                        },
+                    },
+                ),
+            },
+        )
+
+    assert report.open_human_questions == ()
+    assert report.step_reports[0].task_state == "completed"
+
+
 def test_local_runtime_high_autonomy_keeps_manager_moving_on_non_blocking_semantic_questions(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1095,6 +1095,13 @@ class LocalRuntime:
             return None
         if stream_event.event_type not in {"message", "complete"}:
             return None
+        if stream_event.event_type == "message":
+            event_role = str(stream_event.payload_json.get("role") or "").strip().lower()
+            event_source = str(stream_event.payload_json.get("source") or "").strip().lower()
+            if event_role and event_role != "assistant":
+                return None
+            if event_source and event_source not in {"agent", "assistant"}:
+                return None
         questions = extract_semantic_clarification_questions(stream_event.message)
         if not questions:
             return None
