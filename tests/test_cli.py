@@ -173,6 +173,17 @@ def test_bootstrap_vertex_defaults_prefer_gemini_3_and_keep_legacy_profiles(tmp_
     assert "gemini-3-pro-preview" not in {profiles["planner"], profiles["balanced"], profiles["fast"]}
 
 
+def test_bootstrap_runtime_defaults_enable_celery_dispatch(tmp_path: Path) -> None:
+    _write_docs(tmp_path)
+    bootstrap_repository(tmp_path)
+
+    runtime_config = yaml.safe_load((tmp_path / "configs" / "runtime" / "runtime.yaml").read_text(encoding="utf-8"))
+
+    assert runtime_config["execution_backend"] == "celery"
+    assert runtime_config["celery_queue_names"] == ["dispatch"]
+    assert runtime_config["celery_result_expires_seconds"] == 3600
+
+
 def test_module_entrypoint_invokes_main(tmp_path: Path) -> None:
     _write_docs(tmp_path)
     bootstrap_repository(tmp_path)
@@ -231,6 +242,113 @@ def test_new_project_does_not_copy_live_vertex_credentials(tmp_path: Path) -> No
     gitignore_text = (project_path / ".gitignore").read_text(encoding="utf-8")
     assert "workspaces/" in gitignore_text
     assert "dist/" in gitignore_text
+
+
+def test_migrate_project_refreshes_packaged_template_managed_files(tmp_path: Path) -> None:
+    _write_docs(tmp_path)
+    bootstrap_repository(tmp_path)
+    workflow_path = tmp_path / "configs" / "workflows" / "team.workflow.yaml"
+    runtime_path = tmp_path / "configs" / "runtime" / "runtime.yaml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    for task in workflow["task_templates"]:
+        if task["key"] == "review":
+            task["approval_requirements"] = ["human_review"]
+    workflow_path.write_text(yaml.safe_dump(workflow, sort_keys=False), encoding="utf-8")
+    runtime = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    runtime["execution_backend"] = "inline"
+    runtime_path.write_text(yaml.safe_dump(runtime, sort_keys=False), encoding="utf-8")
+
+    result = runner.invoke(app, ["migrate-project", "--root", str(tmp_path)])
+
+    assert result.exit_code == 0
+    migrated_workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    migrated_runtime = yaml.safe_load(runtime_path.read_text(encoding="utf-8"))
+    review_task = next(task for task in migrated_workflow["task_templates"] if task["key"] == "review")
+    assert review_task["approval_requirements"] == []
+    assert migrated_runtime["execution_backend"] == "celery"
+    assert "updated_path=configs/workflows/team.workflow.yaml" in result.stdout
+    assert "updated_path=configs/runtime/runtime.yaml" in result.stdout
+
+
+def test_run_workflow_queue_uses_celery_dispatcher(tmp_path: Path, monkeypatch) -> None:
+    _write_docs(tmp_path)
+    bootstrap_repository(tmp_path)
+
+    class _FakeReceipt:
+        def summary_lines(self) -> list[str]:
+            return [
+                "workflow_run_id=queued_run",
+                "dispatch_backend=celery",
+                "celery_task_id=celery-123",
+                "celery_queue=dispatch",
+            ]
+
+    class _FakeDispatcher:
+        def __init__(self, *, root=None, environ=None):
+            self.root = root
+            self.environ = environ
+
+        def worker_health(self) -> str:
+            return "ok (workers=1; queues=dispatch)"
+
+        def enqueue_new_workflow(self, *, request: str, dispatch: bool, max_steps: int):
+            assert request == "Build a queued storefront"
+            assert dispatch is True
+            assert max_steps == 4
+            return _FakeReceipt()
+
+    monkeypatch.setattr("apps.cli.main.CeleryWorkflowDispatcher", _FakeDispatcher)
+
+    result = runner.invoke(
+        app,
+        [
+            "run-workflow",
+            "--root",
+            str(tmp_path),
+            "--request",
+            "Build a queued storefront",
+            "--dispatch",
+            "--queue",
+            "--max-steps",
+            "4",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "celery_health=ok (workers=1; queues=dispatch)" in result.stdout
+    assert "workflow_run_id=queued_run" in result.stdout
+    assert "celery_task_id=celery-123" in result.stdout
+
+
+def test_worker_command_invokes_celery_worker_main(tmp_path: Path, monkeypatch) -> None:
+    _write_docs(tmp_path)
+    bootstrap_repository(tmp_path)
+    captured: dict[str, object] = {}
+
+    class _FakeDispatcher:
+        def __init__(self, *, root=None, environ=None):
+            self.queue_names = ("dispatch",)
+
+    class _FakeCeleryApp:
+        def worker_main(self, argv: list[str]) -> None:
+            captured["argv"] = argv
+
+    monkeypatch.setattr("apps.cli.main.CeleryWorkflowDispatcher", _FakeDispatcher)
+    monkeypatch.setattr("apps.cli.main.create_autoweave_celery_app", lambda root=None: _FakeCeleryApp())
+
+    result = runner.invoke(app, ["worker", "--root", str(tmp_path), "--concurrency", "2", "--loglevel", "warning"])
+
+    assert result.exit_code == 0
+    assert "celery_queues=dispatch" in result.stdout
+    assert captured["argv"] == [
+        "worker",
+        "--loglevel",
+        "warning",
+        "--concurrency",
+        "2",
+        "--queues",
+        "dispatch",
+    ]
 
 
 def test_cleanup_local_state_purges_runs_and_generated_paths(tmp_path: Path) -> None:

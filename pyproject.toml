@@ -19,6 +19,7 @@ dependencies = [
   "psycopg[binary]>=3.2.12",
   "redis>=6.4.0",
   "neo4j>=5.28.2",
+  "celery>=5.4.0",
 
   "typer>=0.23.0",
 ]

@@ -344,6 +344,60 @@ def test_monitoring_service_launches_background_workflow_job(tmp_path: Path) -> 
     assert "workflow_run_id=run_demo_2" in "\n".join(current["summary_lines"])
 
 
+def test_monitoring_service_can_enqueue_celery_backed_workflow_job(tmp_path: Path, monkeypatch) -> None:
+    bootstrap_repository(tmp_path)
+
+    class _FakeRuntimeConfig:
+        execution_backend = "celery"
+
+    class _FakeDispatcher:
+        def __init__(self, *, root=None, environ=None):
+            self.runtime_config = _FakeRuntimeConfig()
+
+        def worker_health(self) -> str:
+            return "ok (workers=1; queues=dispatch)"
+
+        def enqueue_new_workflow(self, *, request: str, dispatch: bool, max_steps: int):
+            class _Receipt:
+                workflow_run_id = "queued_run"
+                celery_task_id = "celery-job-1"
+                backend = "celery"
+                queue = "dispatch"
+                status = "queued"
+
+            return _Receipt()
+
+        def inspect_task(self, task_id: str):
+            from autoweave.celery_queue import CeleryTaskSnapshot
+
+            return CeleryTaskSnapshot(
+                task_id=task_id,
+                state="SUCCESS",
+                workflow_run_id="queued_run",
+                report_payload={
+                    "workflow_run_id": "queued_run",
+                    "workflow_status": "completed",
+                    "summary_lines": ["workflow_run_id=queued_run", "workflow_status=completed"],
+                    "step_reports": [],
+                    "open_human_questions": [],
+                    "open_approval_reasons": [],
+                },
+            )
+
+    monkeypatch.setattr("autoweave.monitoring.service.CeleryWorkflowDispatcher", _FakeDispatcher)
+
+    service = MonitoringService(root=tmp_path)
+    job = service.launch_workflow(request="Queue a storefront", dispatch=True, max_steps=4)
+    jobs = service.jobs()
+    current = next(item for item in jobs if item["id"] == job["id"])
+
+    assert current["queue_backend"] == "celery"
+    assert current["celery_task_id"] == "celery-job-1"
+    assert current["workflow_run_id"] == "queued_run"
+    assert current["status"] == "completed"
+    assert "workflow_run_id=queued_run" in "\n".join(current["summary_lines"])
+
+
 def test_monitoring_dashboard_wsgi_app_serves_state_and_launch(tmp_path: Path) -> None:
     bootstrap_repository(tmp_path)
     service = MonitoringService(root=tmp_path, runtime_factory=_fake_runtime_factory)

@@ -11,6 +11,7 @@ from threading import Lock, Thread
 from typing import Any, Callable, Iterable, Mapping
 import yaml
 
+from autoweave.celery_queue import CeleryTaskSnapshot, CeleryWorkflowDispatcher, celery_execution_enabled
 from autoweave.compiler.loader import CanonicalConfigLoader
 from autoweave.local_runtime import LocalWorkflowRunReport, build_local_runtime
 from autoweave.models import ArtifactRecord, ApprovalRequestRecord, EventRecord, HumanRequestRecord, TaskAttemptRecord, TaskRecord, WorkflowRunRecord, generate_id
@@ -57,6 +58,10 @@ class MonitoringJob:
     human_request_id: str | None = None
     approval_request_id: str | None = None
     approved: bool | None = None
+    celery_task_id: str | None = None
+    queue_backend: str | None = None
+    queue: str | None = None
+    report_payload: dict[str, Any] | None = None
     error: str | None = None
     report: LocalWorkflowRunReport | None = None
 
@@ -72,6 +77,9 @@ class MonitoringJob:
             "human_request_id": self.human_request_id,
             "approval_request_id": self.approval_request_id,
             "approved": self.approved,
+            "celery_task_id": self.celery_task_id,
+            "queue_backend": self.queue_backend,
+            "queue": self.queue,
             "error": self.error,
         }
         if self.report is not None:
@@ -86,6 +94,9 @@ class MonitoringJob:
                 }
                 for step in self.report.step_reports
             ]
+        elif self.report_payload is not None:
+            payload["summary_lines"] = list(self.report_payload.get("summary_lines", []))
+            payload["step_reports"] = list(self.report_payload.get("step_reports", []))
         return payload
 
 
@@ -311,6 +322,7 @@ class MonitoringService:
         }
 
     def jobs(self) -> list[dict[str, Any]]:
+        self._refresh_queue_jobs()
         with self._lock:
             jobs = [job.to_payload() for job in self._jobs.values()]
         jobs.sort(key=lambda item: item["id"], reverse=True)
@@ -379,10 +391,65 @@ class MonitoringService:
             approval_request_id=approval_request_id,
             approved=approved,
         )
+        dispatcher = self._queue_dispatcher() if dispatch else None
+        if dispatcher is not None:
+            receipt = self._enqueue_celery_job(dispatcher=dispatcher, job=job)
+            with self._lock:
+                self._jobs[job.id] = job
+            return receipt
         with self._lock:
             self._jobs[job.id] = job
         thread = Thread(target=self._run_job, args=(job.id,), daemon=True)
         thread.start()
+        return job.to_payload()
+
+    def _queue_dispatcher(self) -> CeleryWorkflowDispatcher | None:
+        if self._runtime_factory is not build_local_runtime:
+            return None
+        try:
+            dispatcher = CeleryWorkflowDispatcher(root=self.root, environ=self.environ)
+        except Exception:
+            return None
+        if not celery_execution_enabled(dispatcher.runtime_config):
+            return None
+        if not dispatcher.worker_health().startswith("ok"):
+            return None
+        return dispatcher
+
+    def _enqueue_celery_job(self, *, dispatcher: CeleryWorkflowDispatcher, job: MonitoringJob) -> dict[str, Any]:
+        if job.action == "start":
+            receipt = dispatcher.enqueue_new_workflow(
+                request=job.request,
+                dispatch=job.dispatch,
+                max_steps=job.max_steps,
+            )
+        elif job.action == "answer_human":
+            receipt = dispatcher.enqueue_workflow_action(
+                action="answer_human",
+                workflow_run_id=job.workflow_run_id or "",
+                request=job.request,
+                dispatch=job.dispatch,
+                max_steps=job.max_steps,
+                human_request_id=job.human_request_id,
+            )
+        elif job.action == "resolve_approval":
+            receipt = dispatcher.enqueue_workflow_action(
+                action="resolve_approval",
+                workflow_run_id=job.workflow_run_id or "",
+                request=job.request,
+                dispatch=job.dispatch,
+                max_steps=job.max_steps,
+                approval_request_id=job.approval_request_id,
+                approved=job.approved,
+            )
+        else:  # pragma: no cover - defensive guard
+            raise ValueError(f"unknown monitoring action {job.action!r}")
+
+        job.status = receipt.status
+        job.workflow_run_id = receipt.workflow_run_id
+        job.celery_task_id = receipt.celery_task_id
+        job.queue_backend = receipt.backend
+        job.queue = receipt.queue
         return job.to_payload()
 
     def _run_job(self, job_id: str) -> None:
@@ -439,6 +506,54 @@ class MonitoringService:
                 job = self._jobs[job_id]
                 job.status = "error"
                 job.error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+    def _refresh_queue_jobs(self) -> None:
+        dispatcher = self._queue_dispatcher()
+        if dispatcher is None:
+            return
+        with self._lock:
+            queued_jobs = [job for job in self._jobs.values() if job.celery_task_id]
+        for job in queued_jobs:
+            snapshot = dispatcher.inspect_task(job.celery_task_id or "")
+            self._apply_celery_snapshot(job.id, snapshot)
+
+    def _apply_celery_snapshot(self, job_id: str, snapshot: CeleryTaskSnapshot) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            if snapshot.workflow_run_id and not job.workflow_run_id:
+                job.workflow_run_id = snapshot.workflow_run_id
+            if snapshot.report_payload is not None:
+                job.report_payload = snapshot.report_payload
+            if snapshot.error:
+                job.error = snapshot.error
+            state = snapshot.state.upper()
+            if state in {"PENDING", "RECEIVED", "RETRY"}:
+                job.status = "queued"
+                return
+            if state == "STARTED":
+                job.status = "running"
+                return
+            if state == "FAILURE":
+                job.status = "failed"
+                return
+            if state != "SUCCESS":
+                job.status = state.lower()
+                return
+
+            report_payload = snapshot.report_payload or {}
+            open_human = tuple(report_payload.get("open_human_questions", ()))
+            open_approval = tuple(report_payload.get("open_approval_reasons", ()))
+            workflow_status = str(report_payload.get("workflow_status", "running"))
+            if open_human:
+                job.status = "waiting_for_human"
+            elif open_approval:
+                job.status = "waiting_for_approval"
+            elif workflow_status == "failed":
+                job.status = "failed"
+            else:
+                job.status = "completed"
 
     def _run_payload(
         self,

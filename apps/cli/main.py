@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import typer
 
-from apps.cli.bootstrap import bootstrap_repository, repository_root
+from apps.cli.bootstrap import bootstrap_repository, migrate_repository, repository_root
 from apps.cli.validation import ValidationResult, validate_repository
+from autoweave.celery_queue import CeleryWorkflowDispatcher, create_autoweave_celery_app
 from autoweave.local_runtime import build_local_runtime
 from autoweave.monitoring import serve_dashboard
 from autoweave.settings import LocalEnvironmentSettings
@@ -24,6 +26,16 @@ def _echo_validation_result(root_path: Path, result: ValidationResult) -> None:
         typer.echo(f"invalid={issue}")
     for warning in result.warnings:
         typer.echo(f"warning={warning}")
+
+
+def _echo_migration_result(root_path: Path, *, created: tuple[Path, ...], updated: tuple[Path, ...], dry_run: bool) -> None:
+    action = "would_update" if dry_run else "updated"
+    typer.echo(f"created={len(created)}")
+    for path in created:
+        typer.echo(f"created_path={path.relative_to(root_path)}")
+    typer.echo(f"{action}={len(updated)}")
+    for path in updated:
+        typer.echo(f"{action}_path={path.relative_to(root_path)}")
 
 
 @app.command("status")
@@ -74,6 +86,17 @@ def bootstrap(
         typer.echo("updated:")
         for path in result.updated:
             typer.echo(f"- {path.relative_to(root_path)}")
+
+
+@app.command("migrate-project")
+def migrate_project(
+    root: Path | None = typer.Option(None, "--root", help="Project root to migrate"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show which packaged template-managed files would be refreshed"),
+) -> None:
+    """Refresh packaged AutoWeave project-managed files to the latest library templates."""
+    root_path = repository_root(root)
+    result = migrate_repository(root_path, dry_run=dry_run)
+    _echo_migration_result(root_path, created=result.created, updated=result.updated, dry_run=dry_run)
 
 
 @app.command("create-agent")
@@ -141,12 +164,29 @@ def run_workflow(
     root: Path | None = typer.Option(None, "--root", help="Repository root to inspect"),
     request: str = typer.Option(..., "--request", help="User request to seed into the workflow entrypoint"),
     dispatch: bool = typer.Option(False, "--dispatch/--dry-run", help="Dispatch runnable tasks to OpenHands"),
+    queue: bool = typer.Option(False, "--queue", help="Enqueue workflow execution onto Celery instead of running inline"),
     max_steps: int = typer.Option(8, "--max-steps", min=1, help="Maximum runnable tasks to advance in one invocation"),
 ) -> None:
     """Run the current workflow from a user request instead of the fixed sample brief."""
     root_path = repository_root(root)
     repo_result = validate_repository(root_path)
     _echo_validation_result(root_path, repo_result)
+    if queue:
+        try:
+            dispatcher = CeleryWorkflowDispatcher(root=root_path)
+        except RuntimeError as exc:
+            typer.echo(f"celery_error={exc}")
+            raise typer.Exit(code=1)
+        celery_health = dispatcher.worker_health()
+        typer.echo(f"celery_health={celery_health}")
+        if not celery_health.startswith("ok"):
+            raise typer.Exit(code=1)
+        receipt = dispatcher.enqueue_new_workflow(request=request, dispatch=dispatch, max_steps=max_steps)
+        for line in receipt.summary_lines():
+            typer.echo(line)
+        if not repo_result.ok:
+            raise typer.Exit(code=1)
+        return
     with build_local_runtime(root=root_path) as runtime:
         report = runtime.run_workflow(request=request, dispatch=dispatch, max_steps=max_steps)
 
@@ -156,6 +196,37 @@ def run_workflow(
         raise typer.Exit(code=1)
     if not repo_result.ok:
         raise typer.Exit(code=1)
+
+
+@app.command("worker")
+def worker(
+    root: Path | None = typer.Option(None, "--root", help="Project root that owns the Celery-backed AutoWeave queues"),
+    concurrency: int = typer.Option(1, "--concurrency", min=1, help="Celery worker concurrency"),
+    loglevel: str = typer.Option("info", "--loglevel", help="Celery worker log level"),
+    queues: str | None = typer.Option(None, "--queues", help="Comma-separated queue names; defaults to project runtime config"),
+) -> None:
+    """Run a real Celery worker for queued AutoWeave workflow execution."""
+    root_path = repository_root(root)
+    os.environ["AUTOWEAVE_PROJECT_ROOT"] = str(root_path)
+    try:
+        dispatcher = CeleryWorkflowDispatcher(root=root_path)
+        celery_app = create_autoweave_celery_app(root=root_path)
+    except RuntimeError as exc:
+        typer.echo(f"celery_error={exc}")
+        raise typer.Exit(code=1)
+    queue_names = [item.strip() for item in (queues.split(",") if queues else dispatcher.queue_names) if item.strip()]
+    typer.echo(f"celery_queues={','.join(queue_names)}")
+    celery_app.worker_main(
+        [
+            "worker",
+            "--loglevel",
+            loglevel,
+            "--concurrency",
+            str(concurrency),
+            "--queues",
+            ",".join(queue_names),
+        ]
+    )
 
 
 @app.command("ui")

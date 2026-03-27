@@ -67,6 +67,7 @@ class LocalRuntimeDoctorReport:
     vertex_worker_env: dict[str, str]
     canonical_backend: str
     graph_backend: str
+    execution_backend: str
     postgres_target: str
     neo4j_target: str
     redis_target: str
@@ -90,6 +91,7 @@ class LocalRuntimeDoctorReport:
             f"vertex_credentials={self.vertex_worker_env['GOOGLE_APPLICATION_CREDENTIALS']}",
             f"canonical_backend={self.canonical_backend}",
             f"graph_backend={self.graph_backend}",
+            f"execution_backend={self.execution_backend}",
             f"postgres={self.postgres_target}",
             f"postgres_health={self.postgres_health}",
             f"neo4j={self.neo4j_target}",
@@ -671,6 +673,19 @@ class LocalRuntime:
         canonical_graph = self.storage.workflow_repository.get_graph(fresh_graph.workflow_run.id)
         self.orchestration = OrchestrationService(WorkflowRunState.from_graph(canonical_graph))
         self._last_persisted_graph_signature = self._graph_structure_signature()
+
+    def initialize_workflow_run(
+        self,
+        *,
+        request: str,
+        workflow_run_id: str | None = None,
+    ) -> str:
+        self._reset_workflow_run(
+            workflow_run_id=workflow_run_id,
+            root_input_json={"user_request": request},
+        )
+        with self._runtime_lock:
+            return self.orchestration.state.graph.workflow_run.id
 
     def _task_template(self, task_key: str, task: TaskRecord | None = None) -> TaskTemplateConfig:
         for template in self.workflow_definition.task_templates:
@@ -2036,14 +2051,13 @@ class LocalRuntime:
                 probe_path.unlink()
 
     def _probe_celery_health(self) -> str:
-        queue_names = tuple(self.runtime_config.celery_queue_names)
-        if not queue_names:
-            return "disabled (no celery queues configured)"
-        return (
-            "scaffold_only (queues declared: "
-            + ", ".join(queue_names)
-            + "; packaged runtime has no Celery worker binding yet)"
-        )
+        backend = str(self.runtime_config.execution_backend).strip().lower()
+        if backend != "celery":
+            return "disabled (execution_backend=inline)"
+        from autoweave.celery_queue import CeleryWorkflowDispatcher
+
+        dispatcher = CeleryWorkflowDispatcher.from_runtime(self)
+        return dispatcher.worker_health()
 
     def doctor(self) -> LocalRuntimeDoctorReport:
         ready_task_keys = tuple(
@@ -2063,6 +2077,7 @@ class LocalRuntime:
             vertex_worker_env=self.settings.worker_environment(),
             canonical_backend=self.settings.autoweave_canonical_backend,
             graph_backend=self.settings.autoweave_graph_backend,
+            execution_backend=str(self.runtime_config.execution_backend).strip().lower() or "inline",
             postgres_target=json.dumps(self.settings.postgres_target().redacted_dump(), sort_keys=True),
             neo4j_target=json.dumps(self.settings.neo4j_target().redacted_dump(), sort_keys=True),
             redis_target=json.dumps(self.settings.redis_target().redacted_dump(), sort_keys=True),

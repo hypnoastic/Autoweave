@@ -1103,6 +1103,28 @@ def test_cli_doctor_and_run_example_use_composed_runtime(tmp_path: Path, monkeyp
     assert "bootstrap_call=" not in run_result.stdout
 
 
+def test_local_runtime_doctor_reports_real_celery_health_when_backend_is_enabled(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    class _FakeDispatcher:
+        @classmethod
+        def from_runtime(cls, runtime):
+            return cls()
+
+        def worker_health(self) -> str:
+            return "ok (workers=1; queues=dispatch)"
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    monkeypatch.setattr("autoweave.celery_queue.CeleryWorkflowDispatcher", _FakeDispatcher)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.doctor()
+
+    assert report.execution_backend == "celery"
+    assert report.celery_health == "ok (workers=1; queues=dispatch)"
+
+
 def test_cli_run_workflow_uses_composed_runtime(tmp_path: Path, monkeypatch) -> None:
     _prepare_local_root(tmp_path)
     calls: list[dict[str, object]] = []

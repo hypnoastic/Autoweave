@@ -198,9 +198,11 @@ def test_runtime_config_accepts_declared_celery_queues(tmp_path: Path) -> None:
     yaml_path = tmp_path / "runtime.yaml"
     yaml_path.write_text(
         """
+execution_backend: celery
 celery_queue_names:
   - dispatch
   - workers
+celery_result_expires_seconds: 7200
 default_concurrency: 4
 retry_policy:
   max_attempts: 3
@@ -212,7 +214,9 @@ retry_policy:
     loaded = loader.load_runtime_config("runtime.yaml")
 
     assert isinstance(loaded, RuntimeConfig)
+    assert loaded.execution_backend == "celery"
     assert loaded.celery_queue_names == ["dispatch", "workers"]
+    assert loaded.celery_result_expires_seconds == 7200
     assert loaded.default_concurrency == 4
 
 

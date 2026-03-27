@@ -27,6 +27,13 @@ class BootstrapResult:
     updated: tuple[Path, ...] = ()
 
 
+@dataclass(frozen=True)
+class MigrationResult:
+    created: tuple[Path, ...]
+    updated: tuple[Path, ...]
+    unchanged: tuple[Path, ...] = ()
+
+
 def repository_root(root: Path | None = None) -> Path:
     return (Path.cwd() if root is None else root).resolve()
 
@@ -72,6 +79,22 @@ def create_agent(root: Path, name: str, role: str | None = None, *, overwrite: b
     return BootstrapResult(created=tuple(created), updated=tuple(updated))
 
 
+def migrate_repository(root: Path, *, dry_run: bool = False) -> MigrationResult:
+    created: list[Path] = []
+    updated: list[Path] = []
+    unchanged: list[Path] = []
+    for relative_path, content in sample_project.render_project_files().items():
+        absolute_path = root / relative_path
+        status = _sync_text_file(absolute_path, content, dry_run=dry_run)
+        if status == "created":
+            created.append(absolute_path)
+        elif status == "updated":
+            updated.append(absolute_path)
+        else:
+            unchanged.append(absolute_path)
+    return MigrationResult(created=tuple(created), updated=tuple(updated), unchanged=tuple(unchanged))
+
+
 def _write_agent_bundle(root: Path, name: str, role: str, *, overwrite: bool) -> tuple[list[Path], list[Path]]:
     agent_dir = root / "agents" / name
     files = {
@@ -99,3 +122,19 @@ def _write_text_file(path: Path, content: str, *, overwrite: bool) -> tuple[list
     if existed:
         return [], [path]
     return [path], []
+
+
+def _sync_text_file(path: Path, content: str, *, dry_run: bool) -> str:
+    if not path.exists():
+        if not dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        return "created"
+
+    existing = path.read_text(encoding="utf-8")
+    if existing == content:
+        return "unchanged"
+
+    if not dry_run:
+        path.write_text(content, encoding="utf-8")
+    return "updated"
