@@ -260,3 +260,14 @@ def test_cleanup_local_state_purges_runs_and_generated_paths(tmp_path: Path) -> 
     with build_local_runtime(root=tmp_path) as runtime:
         remaining_runs = runtime.storage.workflow_repository.list_workflow_runs()
         assert remaining_runs == []
+
+
+def test_create_agent_command_creates_agent_directory(tmp_path: Path) -> None:
+    _write_docs(tmp_path)
+    result = runner.invoke(app, ["create-agent", "test_engineer", "--root", str(tmp_path)])
+    assert result.exit_code == 0
+    assert (tmp_path / "agents" / "test_engineer" / "soul.md").exists()
+    assert (tmp_path / "agents" / "test_engineer" / "playbook.yaml").exists()
+    assert (tmp_path / "agents" / "test_engineer" / "autoweave.yaml").exists()
+    assert (tmp_path / "agents" / "test_engineer" / "skills" / "README.md").exists()
+    assert "created:" in result.stdout

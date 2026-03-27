@@ -287,7 +287,7 @@ def render_agent_skill_files(role: str) -> dict[Path, str]:
     files = {
         Path("skills/README.md"): render_agent_skills_readme(role),
     }
-    for skill_file in AGENT_SKILL_FILES.get(role, ()):  # pragma: no branch - fixed role table
+    for skill_file in AGENT_SKILL_FILES.get(role, (Path("skills/role_notes.md"),)):
         if skill_file.name == "README.md":
             continue
         files[skill_file] = render_agent_skill_markdown(role, skill_file.name)

@@ -40,7 +40,7 @@ def bootstrap_repository(root: Path, *, overwrite: bool = False) -> BootstrapRes
     updated: list[Path] = []
 
     for role in AGENT_ROLES:
-        role_created, role_updated = _write_agent_bundle(root, role, overwrite=overwrite)
+        role_created, role_updated = _write_agent_bundle(root, name=role, role=role, overwrite=overwrite)
         created.extend(role_created)
         updated.extend(role_updated)
 
@@ -66,15 +66,21 @@ def bootstrap_repository(root: Path, *, overwrite: bool = False) -> BootstrapRes
     return BootstrapResult(created=tuple(created), updated=tuple(updated))
 
 
-def _write_agent_bundle(root: Path, role: str, *, overwrite: bool) -> tuple[list[Path], list[Path]]:
-    role_dir = root / "agents" / role
+def create_agent(root: Path, name: str, role: str | None = None, *, overwrite: bool = False) -> BootstrapResult:
+    agent_role = role or name
+    created, updated = _write_agent_bundle(root, name=name, role=agent_role, overwrite=overwrite)
+    return BootstrapResult(created=tuple(created), updated=tuple(updated))
+
+
+def _write_agent_bundle(root: Path, name: str, role: str, *, overwrite: bool) -> tuple[list[Path], list[Path]]:
+    agent_dir = root / "agents" / name
     files = {
-        role_dir / "soul.md": sample_project.render_agent_soul(role),
-        role_dir / "playbook.yaml": sample_project.render_agent_playbook(role),
-        role_dir / "autoweave.yaml": sample_project.render_agent_autoweave(role),
+        agent_dir / "soul.md": sample_project.render_agent_soul(role),
+        agent_dir / "playbook.yaml": sample_project.render_agent_playbook(role),
+        agent_dir / "autoweave.yaml": sample_project.render_agent_autoweave(role),
     }
     for relative_path, content in sample_project.render_agent_skill_files(role).items():
-        files[role_dir / relative_path] = content
+        files[agent_dir / relative_path] = content
     created: list[Path] = []
     updated: list[Path] = []
     for path, content in files.items():

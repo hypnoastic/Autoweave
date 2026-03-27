@@ -15,6 +15,9 @@ CANONICAL_VERTEX_CREDENTIALS = Path("config/secrets/vertex_service_account.json"
 DEFAULT_ARTIFACT_DIR = Path("var/artifacts")
 DEFAULT_OBSERVABILITY_DIR = Path("var/observability")
 DEFAULT_WORKSPACES_DIR = Path("workspaces")
+DEFAULT_OPENHANDS_POLL_TIMEOUT_SECONDS = 300
+OPENHANDS_POLL_TIMEOUT_GRACE_SECONDS = 30
+MAX_OPENHANDS_POLL_TIMEOUT_SECONDS = 3600
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -87,6 +90,16 @@ def get_env_value(env_map: Mapping[str, str], key: str, default: str = "") -> st
         return default
     stripped = value.strip()
     return stripped if stripped else default
+
+
+def derive_openhands_poll_timeout_seconds(worker_timeout_seconds: int) -> int:
+    """Keep the conversation poll window aligned with the worker timeout budget."""
+
+    worker_timeout = max(int(worker_timeout_seconds), 1)
+    return max(
+        DEFAULT_OPENHANDS_POLL_TIMEOUT_SECONDS,
+        min(worker_timeout + OPENHANDS_POLL_TIMEOUT_GRACE_SECONDS, MAX_OPENHANDS_POLL_TIMEOUT_SECONDS),
+    )
 
 
 def ensure_vertex_credentials_layout(root: Path) -> Path:
@@ -254,7 +267,7 @@ class LocalEnvironmentSettings(BaseModel):
     autoweave_max_active_attempts: int = 8
     autoweave_heartbeat_interval_seconds: int = 15
     autoweave_lease_ttl_seconds: int = 60
-    autoweave_openhands_poll_timeout_seconds: int = 90
+    autoweave_openhands_poll_timeout_seconds: int = DEFAULT_OPENHANDS_POLL_TIMEOUT_SECONDS
     autoweave_openhands_poll_interval_seconds: int = 1
 
     @classmethod
@@ -274,6 +287,14 @@ class LocalEnvironmentSettings(BaseModel):
 
         artifact_store_url = get_env_value(env_map, "ARTIFACT_STORE_URL", f"file://{(project_root / DEFAULT_ARTIFACT_DIR).resolve()}")
 
+        openhands_worker_timeout_seconds = int(get_env_value(env_map, "OPENHANDS_WORKER_TIMEOUT_SECONDS", "1800"))
+        explicit_poll_timeout = get_env_value(env_map, "AUTOWEAVE_OPENHANDS_POLL_TIMEOUT_SECONDS")
+        openhands_poll_timeout_seconds = (
+            int(explicit_poll_timeout)
+            if explicit_poll_timeout
+            else derive_openhands_poll_timeout_seconds(openhands_worker_timeout_seconds)
+        )
+
         settings = cls(
             project_root=project_root,
             loaded_env_files=loaded_files,
@@ -289,7 +310,7 @@ class LocalEnvironmentSettings(BaseModel):
             artifact_store_url=artifact_store_url,
             openhands_agent_server_base_url=get_env_value(env_map, "OPENHANDS_AGENT_SERVER_BASE_URL", "http://127.0.0.1:8000"),
             openhands_agent_server_api_key=get_env_value(env_map, "OPENHANDS_AGENT_SERVER_API_KEY") or None,
-            openhands_worker_timeout_seconds=int(get_env_value(env_map, "OPENHANDS_WORKER_TIMEOUT_SECONDS", "1800")),
+            openhands_worker_timeout_seconds=openhands_worker_timeout_seconds,
             autoweave_default_workflow=Path(get_env_value(env_map, "AUTOWEAVE_DEFAULT_WORKFLOW", "configs/workflows/team.workflow.yaml")),
             autoweave_runtime_config=Path(get_env_value(env_map, "AUTOWEAVE_RUNTIME_CONFIG", "configs/runtime/runtime.yaml")),
             autoweave_storage_config=Path(get_env_value(env_map, "AUTOWEAVE_STORAGE_CONFIG", "configs/runtime/storage.yaml")),
@@ -303,9 +324,7 @@ class LocalEnvironmentSettings(BaseModel):
             autoweave_max_active_attempts=int(get_env_value(env_map, "AUTOWEAVE_MAX_ACTIVE_ATTEMPTS", "8")),
             autoweave_heartbeat_interval_seconds=int(get_env_value(env_map, "AUTOWEAVE_HEARTBEAT_INTERVAL_SECONDS", "15")),
             autoweave_lease_ttl_seconds=int(get_env_value(env_map, "AUTOWEAVE_LEASE_TTL_SECONDS", "60")),
-            autoweave_openhands_poll_timeout_seconds=int(
-                get_env_value(env_map, "AUTOWEAVE_OPENHANDS_POLL_TIMEOUT_SECONDS", "90")
-            ),
+            autoweave_openhands_poll_timeout_seconds=openhands_poll_timeout_seconds,
             autoweave_openhands_poll_interval_seconds=int(
                 get_env_value(env_map, "AUTOWEAVE_OPENHANDS_POLL_INTERVAL_SECONDS", "1")
             ),

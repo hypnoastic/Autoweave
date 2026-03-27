@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +92,40 @@ _APPROVAL_REQUIRED_PREFIXES = (
     "APPROVAL_REQUIRED:",
     "REVIEW_REQUIRED:",
 )
+_CLARIFICATION_CUE_PHRASES = (
+    "need clarification",
+    "need a clarification",
+    "need more detail",
+    "need more details",
+    "missing detail",
+    "missing details",
+    "before i proceed",
+    "before proceeding",
+    "please clarify",
+    "could you clarify",
+    "can you clarify",
+    "please confirm",
+    "confirm whether",
+)
+_INTERROGATIVE_WORDS = {
+    "what",
+    "which",
+    "who",
+    "when",
+    "where",
+    "why",
+    "how",
+    "is",
+    "are",
+    "should",
+    "would",
+    "could",
+    "can",
+    "do",
+    "does",
+    "did",
+    "will",
+}
 
 
 def normalize_openhands_stream_event(event: Mapping[str, Any] | OpenHandsStreamEvent) -> OpenHandsStreamEvent:
@@ -321,6 +356,44 @@ def _extract_control_marker(message: str) -> tuple[str, str | None]:
         if upper.startswith(prefix):
             return text[len(prefix):].strip(), "approval_required"
     return message, None
+
+
+def extract_semantic_clarification_questions(message: str) -> tuple[str, ...]:
+    """Extract clarification questions from natural language assistant output."""
+
+    text = message.strip()
+    if not text:
+        return ()
+
+    pattern = re.compile(
+        r"(?i)(?:^|[.:]\s*)"
+        r"((?:what|which|who|when|where|why|how|is|are|should|would|could|can|do|does|did|will)\b[^?]*\?)$"
+    )
+    candidates: list[str] = []
+    for chunk in re.split(r"(?<=[?])\s+|\n+", text):
+        match = pattern.search(chunk.strip())
+        if match is None:
+            continue
+        candidates.append(re.sub(r"\s+", " ", match.group(1).strip(" -*\t")))
+
+    if not candidates:
+        return ()
+
+    lower_text = text.lower()
+    cue_present = any(phrase in lower_text for phrase in _CLARIFICATION_CUE_PHRASES)
+    if not cue_present and len(candidates) == 1:
+        if not any(token in lower_text for token in ("clarif", "confirm", "missing", "before", "need")):
+            return ()
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        deduped.append(candidate)
+        seen.add(key)
+    return tuple(deduped[:3])
 
 
 def _content_part_types(content: Any) -> list[str]:

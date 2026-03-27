@@ -15,6 +15,7 @@ from autoweave.workers.runtime import (
     OpenHandsStreamEvent,
     WorkspacePolicy,
     build_openhands_conversation_request,
+    extract_semantic_clarification_questions,
     extract_openhands_stream_events,
     normalize_openhands_stream_event,
     resolve_openhands_reasoning_effort,
@@ -281,6 +282,19 @@ def test_human_input_marker_is_normalized_to_requires_human() -> None:
     assert event.requires_human is True
     assert event.terminal is True
     assert event.message == "What product categories should the first release support?"
+
+
+def test_semantic_clarification_questions_are_extracted_from_natural_language() -> None:
+    questions = extract_semantic_clarification_questions(
+        "Before I proceed, I need clarification on a few points. "
+        "What exactly is being booked? Should payment be collected upfront? "
+        "Whether cancellation is free within 24 hours?"
+    )
+
+    assert questions == (
+        "What exactly is being booked?",
+        "Should payment be collected upfront?",
+    )
 
 
 def test_openhands_stream_events_normalize_and_materialize_artifacts(tmp_path: Path) -> None:

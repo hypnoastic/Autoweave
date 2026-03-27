@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -17,7 +20,7 @@ from autoweave.settings import CANONICAL_VERTEX_CREDENTIALS, LocalEnvironmentSet
 from autoweave.storage.coordination import RedisClient, RedisIdempotencyStore, RedisLeaseManager
 from autoweave.storage.durable import SQLiteWorkflowRepository
 from autoweave.storage.wiring import LocalStorageWiring, RedisWireSpec, StorageConnectionTargets
-from autoweave.workers.runtime import OpenHandsAgentServerClient
+from autoweave.workers.runtime import OpenHandsAgentServerClient, OpenHandsStreamEvent
 
 
 runner = CliRunner()
@@ -309,6 +312,61 @@ def _finish_tool_transport(calls: list[dict[str, object]]) -> httpx.MockTranspor
     return httpx.MockTransport(handler)
 
 
+def _progress_only_transport(calls: list[dict[str, object]]) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: dict[str, object] = {}
+        if request.content:
+            body = json.loads(request.content.decode("utf-8"))
+        calls.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "headers": {key.lower(): value for key, value in request.headers.items()},
+                "body": body,
+            }
+        )
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/api/conversations":
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conversation-progress",
+                    "workspace": body.get("workspace", {}),
+                    "agent": body.get("agent", {}),
+                    "execution_status": "running",
+                    "persistence_dir": "workspace/conversations/conversation-progress",
+                },
+            )
+        if request.url.path == "/api/conversations/conversation-progress":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conversation-progress",
+                    "execution_status": "running",
+                    "persistence_dir": "workspace/conversations/conversation-progress",
+                },
+            )
+        if request.url.path == "/api/conversations/conversation-progress/events/search":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "type": "progress",
+                            "message": "worker still running",
+                            "outcome": "running",
+                            "terminal": False,
+                        }
+                    ],
+                    "next_page_id": None,
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    return httpx.MockTransport(handler)
+
+
 def test_local_environment_settings_normalize_vertex_credentials(tmp_path: Path) -> None:
     _prepare_local_root(tmp_path)
 
@@ -424,6 +482,7 @@ def test_local_runtime_bootstrap_composes_and_dispatches(tmp_path: Path, monkeyp
         "/api/conversations/conversation-1",
         "/api/conversations/conversation-1",
         "/api/conversations/conversation-1/events/search",
+        "/api/conversations/conversation-1",
     ]
 
 
@@ -442,6 +501,42 @@ def test_local_runtime_treats_finish_tool_events_as_success(tmp_path: Path, monk
     manifests = [runtime.storage.artifact_store.read_manifest(artifact_id) for artifact_id in example.artifact_ids]
     assert {manifest["artifact"]["artifact_type"] for manifest in manifests} == {"openhands_replay", "workflow_plan"}
     assert any(manifest["payload"] == "Completed the manager plan for the storefront." for manifest in manifests)
+
+
+def test_local_runtime_retries_poll_timeout_before_failing(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _progress_only_transport(calls)
+    wait_calls: list[float] = []
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+
+    def fake_wait_for_conversation(self, conversation_id: str, *, timeout_seconds: float, poll_interval_seconds: float = 1.0):
+        wait_calls.append(timeout_seconds)
+        if len(wait_calls) == 1:
+            return replace(
+                type(self).get_conversation(self, conversation_id),
+                ok=False,
+                error=f"conversation poll timed out after {timeout_seconds:.1f}s",
+            )
+        return replace(
+            type(self).get_conversation(self, conversation_id),
+            ok=True,
+            error=None,
+            response_json={"id": conversation_id, "execution_status": "finished"},
+        )
+
+    monkeypatch.setattr(OpenHandsAgentServerClient, "wait_for_conversation", fake_wait_for_conversation)
+
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        example = runtime.run_example(dispatch=True)
+
+    assert example.task_state == "completed"
+    assert example.attempt_state == "succeeded"
+    assert example.stream_event_types == ("progress", "complete")
+    assert len(wait_calls) == 2
+    assert wait_calls[0] == runtime.settings.autoweave_openhands_poll_timeout_seconds
+    assert wait_calls[1] == 10.0
 
 
 def test_local_runtime_run_workflow_propagates_request_and_advances_multiple_tasks(tmp_path: Path, monkeypatch) -> None:
@@ -474,6 +569,57 @@ def test_local_runtime_run_workflow_propagates_request_and_advances_multiple_tas
         for prompt in downstream_prompts
     )
     assert any('"upstream_artifacts"' in prompt for prompt in downstream_prompts)
+
+
+def test_local_runtime_dispatches_newly_ready_backend_work_while_frontend_branch_is_still_running(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+    timeline: dict[str, float] = {}
+    timeline_lock = threading.Lock()
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+
+    def fake_collect(self, *, task, attempt, bootstrap_call, stream_events):
+        with timeline_lock:
+            timeline[f"{task.task_key}_start"] = time.monotonic()
+        if task.task_key == "frontend_ui":
+            time.sleep(0.2)
+        with timeline_lock:
+            timeline[f"{task.task_key}_end"] = time.monotonic()
+        return (
+            [
+                OpenHandsStreamEvent(event_type="progress", message=f"{task.task_key} running", outcome="running"),
+                OpenHandsStreamEvent(
+                    event_type="complete",
+                    message=f"{task.task_key} completed",
+                    outcome="success",
+                    terminal=True,
+                ),
+            ],
+            (),
+        )
+
+    monkeypatch.setattr("autoweave.local_runtime.LocalRuntime._collect_openhands_stream", fake_collect)
+
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.run_workflow(
+            request="Build a small ecommerce website for clothing brands. Ask for clarification if checkout or product constraints are missing.",
+            dispatch=True,
+            max_steps=4,
+        )
+
+    assert report.dispatched_task_keys[0] == "manager_plan"
+    assert set(report.dispatched_task_keys[1:3]) == {"backend_contract", "frontend_ui"}
+    assert report.dispatched_task_keys[3] == "backend_impl"
+    assert "frontend_ui_start" in timeline
+    assert "frontend_ui_end" in timeline
+    assert "backend_contract_end" in timeline
+    assert "backend_impl_start" in timeline
+    assert timeline["backend_contract_end"] < timeline["frontend_ui_end"]
+    assert timeline["backend_impl_start"] < timeline["frontend_ui_end"]
 
 
 def test_local_runtime_run_workflow_stops_on_human_input_request(tmp_path: Path, monkeypatch) -> None:
@@ -510,6 +656,49 @@ def test_local_runtime_run_workflow_stops_on_human_input_request(tmp_path: Path,
     assert report.workflow_status == "running"
     assert report.open_human_questions == (
         "Which payment providers and shipping regions should the first release support?",
+    )
+    assert report.step_reports[0].attempt_state == "needs_input"
+    assert report.step_reports[0].task_state == "waiting_for_human"
+
+
+def test_local_runtime_promotes_manager_semantic_clarification_to_waiting_for_human(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.run_workflow(
+            request="Build a modern booking app.",
+            dispatch=True,
+            max_steps=1,
+            stream_events_by_task={
+                "manager_plan": (
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Before I proceed, I need clarification. "
+                                        "What exact thing is being booked? "
+                                        "Should payment be collected upfront?"
+                                    ),
+                                }
+                            ],
+                            "tool_calls": None,
+                        },
+                    },
+                ),
+            },
+        )
+
+    assert report.dispatched_task_keys == ("manager_plan",)
+    assert report.open_human_questions == (
+        "What exact thing is being booked?\nShould payment be collected upfront?",
     )
     assert report.step_reports[0].attempt_state == "needs_input"
     assert report.step_reports[0].task_state == "waiting_for_human"
@@ -799,11 +988,111 @@ def test_local_runtime_surfaces_empty_response_loop_with_precise_reason(tmp_path
     with build_local_runtime(root=tmp_path, environ={}, transport=httpx.MockTransport(handler)) as runtime:
         example = runtime.run_example(dispatch=True)
 
-    assert example.task_state == "failed"
-    assert example.attempt_state == "errored"
-    assert example.stream_event_types == ("progress", "empty_response", "empty_response", "error")
+    assert example.task_state == "blocked"
+    assert example.attempt_state == "orphaned"
+    assert example.stream_event_types[:4] == ("progress", "empty_response", "empty_response", "error")
+    assert example.stream_event_types[-1] == "error"
     assert example.failure_reason is not None
     assert "worker_empty_response_loop" in example.failure_reason
+
+
+def test_local_runtime_retries_empty_response_loop_before_succeeding(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+
+    def fake_collect(self, *, task, attempt, bootstrap_call, stream_events):
+        if attempt.attempt_number == 1:
+            return (
+                [
+                    OpenHandsStreamEvent(event_type="progress", message="worker started", outcome="running"),
+                    OpenHandsStreamEvent(event_type="empty_response", empty_response=True),
+                    OpenHandsStreamEvent(event_type="empty_response", empty_response=True),
+                    OpenHandsStreamEvent(
+                        event_type="error",
+                        message="worker_empty_response_loop: OpenHands emitted 2 empty assistant responses",
+                        payload_json={"diagnostic_code": "worker_empty_response_loop"},
+                        outcome="error",
+                        terminal=True,
+                    ),
+                ],
+                (),
+            )
+        return (
+            [
+                OpenHandsStreamEvent(event_type="progress", message="worker restarted", outcome="running"),
+                OpenHandsStreamEvent(
+                    event_type="complete",
+                    message="Recovered on retry and completed the plan.",
+                    outcome="success",
+                    terminal=True,
+                ),
+            ],
+            (),
+        )
+
+    monkeypatch.setattr("autoweave.local_runtime.LocalRuntime._collect_openhands_stream", fake_collect)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        runtime.runtime_config.retry_policy["max_attempts"] = 3
+        runtime.runtime_config.retry_policy["backoff_seconds"] = 0
+        example = runtime.run_example(dispatch=True)
+        attempts = runtime.storage.workflow_repository.list_attempts_for_run(example.workflow_run_id)
+
+    assert example.task_state == "completed"
+    assert example.attempt_state == "succeeded"
+    assert example.failure_reason is None
+    assert example.stream_event_types == (
+        "progress",
+        "empty_response",
+        "empty_response",
+        "error",
+        "progress",
+        "complete",
+    )
+    assert [attempt.state.value for attempt in attempts] == ["orphaned", "succeeded"]
+
+
+def test_local_runtime_refreshes_finished_conversation_before_marking_stale_running_task(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+    original_get_conversation = OpenHandsAgentServerClient.get_conversation
+    get_calls = {"count": 0}
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+
+    def fake_wait_for_conversation(self, conversation_id: str, *, timeout_seconds: float, poll_interval_seconds: float = 1.0):
+        response = original_get_conversation(self, conversation_id)
+        return replace(
+            response,
+            response_json={
+                **response.response_json,
+                "execution_status": "running",
+            },
+        )
+
+    def fake_get_conversation(self, conversation_id: str):
+        response = original_get_conversation(self, conversation_id)
+        get_calls["count"] += 1
+        status = "running" if get_calls["count"] == 1 else "finished"
+        return replace(
+            response,
+            response_json={
+                **response.response_json,
+                "execution_status": status,
+            },
+        )
+
+    monkeypatch.setattr(OpenHandsAgentServerClient, "wait_for_conversation", fake_wait_for_conversation)
+    monkeypatch.setattr(OpenHandsAgentServerClient, "get_conversation", fake_get_conversation)
+
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        example = runtime.run_example(dispatch=True)
+
+    assert example.task_state == "completed"
+    assert example.attempt_state == "succeeded"
 
 
 def test_local_runtime_reuses_existing_canonical_graph_on_restart(tmp_path: Path, monkeypatch) -> None:

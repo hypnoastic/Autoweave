@@ -6,6 +6,7 @@ from autoweave.settings import (
     CANONICAL_VERTEX_CREDENTIALS,
     DEFAULT_ARTIFACT_DIR,
     LocalEnvironmentSettings,
+    derive_openhands_poll_timeout_seconds,
     find_project_root,
     redact_connection_url,
 )
@@ -91,6 +92,9 @@ def test_settings_default_local_paths_and_worker_environment(tmp_path: Path) -> 
     assert settings.redis_target().host == "127.0.0.1"
     assert settings.neo4j_target().uses_aura is True
     assert settings.postgres_target().host == "host"
+    assert settings.autoweave_openhands_poll_timeout_seconds == derive_openhands_poll_timeout_seconds(
+        settings.openhands_worker_timeout_seconds
+    )
 
 
 def test_settings_load_vertex_profile_override(tmp_path: Path) -> None:
@@ -165,3 +169,26 @@ def test_connection_targets_redact_embedded_credentials(tmp_path: Path) -> None:
     assert redis["url"] == "redis://***@127.0.0.1:6379/0"
     assert neo4j["password"] == "***"
     assert redact_connection_url("https://example.com/path") == "https://example.com/path"
+
+
+def test_settings_respect_explicit_openhands_poll_timeout_override(tmp_path: Path) -> None:
+    _seed_repo(tmp_path)
+    (tmp_path / ".env.local").write_text(
+        "\n".join(
+            [
+                "VERTEXAI_PROJECT=demo-project",
+                "VERTEXAI_LOCATION=global",
+                "POSTGRES_URL=postgresql://user@host/db",
+                "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
+                "OPENHANDS_WORKER_TIMEOUT_SECONDS=1800",
+                "AUTOWEAVE_OPENHANDS_POLL_TIMEOUT_SECONDS=120",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "credentials.json").write_text("{}", encoding="utf-8")
+
+    settings = LocalEnvironmentSettings.load(root=tmp_path)
+
+    assert settings.autoweave_openhands_poll_timeout_seconds == 120

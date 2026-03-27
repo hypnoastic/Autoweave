@@ -63,11 +63,11 @@ def build_sdist(sdist_directory, config_settings=None):  # noqa: D401, ANN001
     with tempfile.TemporaryDirectory() as tmpdir:
         staging = Path(tmpdir) / f"{NAME}-{VERSION}"
         staging.mkdir(parents=True, exist_ok=True)
-        for relative in ("autoweave", "apps", "configs", "agents", "docs"):
+        for relative in ("autoweave", "apps", "docs", "tests"):
             source = ROOT / relative
             if source.exists():
                 _copy_tree(source, staging / relative)
-        for relative in ("pyproject.toml", "context.md", "AGENTS.md", "README.md", "build_backend.py"):
+        for relative in ("pyproject.toml", "README.md", "build_backend.py", ".gitignore", ".dockerignore", "Dockerfile", "docker-compose.yml"):
             source = ROOT / relative
             if source.exists():
                 (staging / relative).write_bytes(source.read_bytes())

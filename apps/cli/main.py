@@ -76,6 +76,29 @@ def bootstrap(
             typer.echo(f"- {path.relative_to(root_path)}")
 
 
+@app.command("create-agent")
+def create_agent(
+    name: str = typer.Argument(..., help="Name of the new agent"),
+    role: str | None = typer.Option(None, "--role", help="Template role to base this agent on (e.g., manager, backend, frontend, reviewer)"),
+    root: Path | None = typer.Option(None, "--root", help="Repository root"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing agent files"),
+) -> None:
+    """Create a new agent bundle with soul, playbook, config, and skills."""
+    from apps.cli.bootstrap import create_agent as create_agent_bundle
+    root_path = repository_root(root)
+    result = create_agent_bundle(root_path, name=name, role=role, overwrite=overwrite)
+    if result.created:
+        typer.echo("created:")
+        for path in result.created:
+            typer.echo(f"- {path.relative_to(root_path)}")
+    else:
+        typer.echo("created=0")
+    if result.updated:
+        typer.echo("updated:")
+        for path in result.updated:
+            typer.echo(f"- {path.relative_to(root_path)}")
+
+
 @app.command("doctor")
 def doctor(root: Path | None = typer.Option(None, "--root", help="Repository root to inspect")) -> None:
     """Inspect local env, configs, and the OpenHands bootstrap path."""

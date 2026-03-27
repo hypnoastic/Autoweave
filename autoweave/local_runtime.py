@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import threading
 import json
 import shutil
-from dataclasses import dataclass, field
+import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -22,6 +25,7 @@ from autoweave.workers.runtime import (
     OpenHandsRemoteWorkerAdapter,
     OpenHandsServiceCall,
     OpenHandsStreamEvent,
+    extract_semantic_clarification_questions,
     extract_openhands_stream_events,
     normalize_openhands_stream_event,
     stream_event_to_artifact,
@@ -45,6 +49,8 @@ class LocalRuntimeDoctorReport:
     artifact_store_path: Path
     openhands_target: str
     openhands_health: OpenHandsServiceCall
+    openhands_worker_timeout_seconds: int
+    openhands_poll_timeout_seconds: int
     ready_task_keys: tuple[str, ...]
 
     def summary_lines(self) -> list[str]:
@@ -59,6 +65,8 @@ class LocalRuntimeDoctorReport:
             f"artifact_store={self.artifact_store_path}",
             f"openhands={self.openhands_target}",
             f"openhands_health={'ok' if self.openhands_health.ok else 'unreachable'}",
+            f"openhands_worker_timeout_seconds={self.openhands_worker_timeout_seconds}",
+            f"openhands_poll_timeout_seconds={self.openhands_poll_timeout_seconds}",
             f"ready_tasks={', '.join(self.ready_task_keys) or 'none'}",
         ]
         if self.openhands_health.error:
@@ -203,6 +211,11 @@ class LocalRuntime:
         init=False,
         repr=False,
     )
+    _runtime_lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        init=False,
+        repr=False,
+    )
 
     @classmethod
     def build(
@@ -323,7 +336,8 @@ class LocalRuntime:
         self._last_persisted_graph_signature = self._graph_structure_signature()
 
     def _workflow_request(self) -> str:
-        return str(self.orchestration.state.graph.workflow_run.root_input_json.get("user_request", "")).strip()
+        with self._runtime_lock:
+            return str(self.orchestration.state.graph.workflow_run.root_input_json.get("user_request", "")).strip()
 
     def _upstream_artifact_context(self, task: TaskRecord) -> list[dict[str, object]]:
         artifacts = self.storage.context_service.get_upstream_artifacts(task_id=task.id)
@@ -341,24 +355,25 @@ class LocalRuntime:
         ]
 
     def _prepare_task_for_dispatch(self, task: TaskRecord) -> TaskRecord:
-        merged_input = dict(self.orchestration.state.graph.workflow_run.root_input_json)
-        merged_input.update(task.input_json)
-        workflow_request = self._workflow_request()
-        if workflow_request and not str(merged_input.get("user_request", "")).strip():
-            merged_input["user_request"] = workflow_request
-        upstream_artifacts = self._upstream_artifact_context(task)
-        if upstream_artifacts:
-            merged_input["upstream_artifacts"] = upstream_artifacts
-        if task.required_artifact_types_json:
-            merged_input["required_artifact_types"] = list(task.required_artifact_types_json)
-        if task.produced_artifact_types_json:
-            merged_input["produced_artifact_types"] = list(task.produced_artifact_types_json)
-        if merged_input == task.input_json:
-            return task
-        updated_task = task.model_copy(update={"input_json": merged_input})
-        self.orchestration.state.update_task(updated_task)
-        self._sync_canonical_state()
-        return self.orchestration.state.task(task.id)
+        with self._runtime_lock:
+            merged_input = dict(self.orchestration.state.graph.workflow_run.root_input_json)
+            merged_input.update(task.input_json)
+            workflow_request = self._workflow_request()
+            if workflow_request and not str(merged_input.get("user_request", "")).strip():
+                merged_input["user_request"] = workflow_request
+            upstream_artifacts = self._upstream_artifact_context(task)
+            if upstream_artifacts:
+                merged_input["upstream_artifacts"] = upstream_artifacts
+            if task.required_artifact_types_json:
+                merged_input["required_artifact_types"] = list(task.required_artifact_types_json)
+            if task.produced_artifact_types_json:
+                merged_input["produced_artifact_types"] = list(task.produced_artifact_types_json)
+            if merged_input == task.input_json:
+                return task
+            updated_task = task.model_copy(update={"input_json": merged_input})
+            self.orchestration.state.update_task(updated_task)
+            self._sync_canonical_state()
+            return self.orchestration.state.task(task.id)
 
     def _approval_policy_requires_pre_dispatch(
         self,
@@ -368,16 +383,17 @@ class LocalRuntime:
         approval_requirements: list[str],
     ) -> bool:
         policy = agent_definition.approval_policy.strip().lower()
-        if approval_requirements:
-            for request in self.orchestration.state.approval_requests.values():
-                if request.task_id != task.id:
-                    continue
-                if request.approval_type not in approval_requirements:
-                    continue
-                if request.status == ApprovalStatus.APPROVED:
-                    return False
-            return True
-        return policy in {"request-before-execution", "approval-before-execution", "human-review-required"}
+        with self._runtime_lock:
+            if approval_requirements:
+                for request in self.orchestration.state.approval_requests.values():
+                    if request.task_id != task.id:
+                        continue
+                    if request.approval_type not in approval_requirements:
+                        continue
+                    if request.status == ApprovalStatus.APPROVED:
+                        return False
+                return True
+            return policy in {"request-before-execution", "approval-before-execution", "human-review-required"}
 
     def _approval_reason(
         self,
@@ -392,23 +408,39 @@ class LocalRuntime:
         return f"Approval policy requires operator confirmation before dispatch for role {agent_definition.role}"
 
     def _latest_active_attempt(self, task_id: str) -> TaskAttemptRecord | None:
-        active_attempts = self.orchestration.active_attempts(task_id)
-        if not active_attempts:
-            return None
-        active_attempts.sort(key=lambda item: item.attempt_number)
-        return active_attempts[-1]
+        with self._runtime_lock:
+            active_attempts = self.orchestration.active_attempts(task_id)
+            if not active_attempts:
+                return None
+            active_attempts.sort(key=lambda item: item.attempt_number)
+            return active_attempts[-1]
+
+    def _max_parallel_dispatches(self) -> int:
+        configured_limit = self.settings.autoweave_max_active_attempts
+        try:
+            configured_limit = max(1, int(configured_limit))
+        except (TypeError, ValueError):
+            configured_limit = 1
+        workflow_limit = self.workflow_definition.policies.get("max_active_attempts")
+        try:
+            if workflow_limit is not None:
+                configured_limit = min(configured_limit, max(1, int(workflow_limit)))
+        except (TypeError, ValueError):
+            pass
+        return configured_limit
 
     def _worker_workspace_path(self, attempt_id: str) -> str:
         return str(Path("/workspace") / "workspaces" / attempt_id)
 
     def _graph_structure_signature(self) -> tuple[str, int, tuple[str, ...], tuple[str, ...]]:
-        graph = self.orchestration.state.graph
-        return (
-            graph.workflow_run.id,
-            graph.workflow_run.graph_revision,
-            tuple(task.id for task in graph.tasks),
-            tuple(edge.id for edge in graph.edges),
-        )
+        with self._runtime_lock:
+            graph = self.orchestration.state.graph
+            return (
+                graph.workflow_run.id,
+                graph.workflow_run.graph_revision,
+                tuple(task.id for task in graph.tasks),
+                tuple(edge.id for edge in graph.edges),
+            )
 
     def _ensure_canonical_graph_seeded(self) -> None:
         if self._last_persisted_graph_signature is not None:
@@ -448,48 +480,49 @@ class LocalRuntime:
     def _sync_canonical_state(self) -> None:
         """Persist the authoritative orchestration snapshot through the repository wiring."""
 
-        repository = self.storage.workflow_repository
-        graph_signature = self._graph_structure_signature()
-        full_graph_sync = graph_signature != self._last_persisted_graph_signature
-        tasks = list(self.orchestration.state.tasks_by_id.values())
-        attempts = list(self.orchestration.state.attempts_by_id.values())
-        human_requests = list(self.orchestration.state.human_requests.values())
-        approval_requests = list(self.orchestration.state.approval_requests.values())
+        with self._runtime_lock:
+            repository = self.storage.workflow_repository
+            graph_signature = self._graph_structure_signature()
+            full_graph_sync = graph_signature != self._last_persisted_graph_signature
+            tasks = list(self.orchestration.state.tasks_by_id.values())
+            attempts = list(self.orchestration.state.attempts_by_id.values())
+            human_requests = list(self.orchestration.state.human_requests.values())
+            approval_requests = list(self.orchestration.state.approval_requests.values())
 
-        if hasattr(repository, "save_runtime_state"):
-            repository.save_runtime_state(
-                workflow_run=self.orchestration.state.graph.workflow_run,
-                tasks=tasks,
-                attempts=attempts,
-                human_requests=human_requests,
-                approval_requests=approval_requests,
-                graph=self.orchestration.state.graph if full_graph_sync else None,
-            )
+            if hasattr(repository, "save_runtime_state"):
+                repository.save_runtime_state(
+                    workflow_run=self.orchestration.state.graph.workflow_run,
+                    tasks=tasks,
+                    attempts=attempts,
+                    human_requests=human_requests,
+                    approval_requests=approval_requests,
+                    graph=self.orchestration.state.graph if full_graph_sync else None,
+                )
+                if full_graph_sync:
+                    self._last_persisted_graph_signature = graph_signature
+                return
+
             if full_graph_sync:
+                repository.save_graph(self.orchestration.state.graph)
                 self._last_persisted_graph_signature = graph_signature
-            return
+            elif hasattr(repository, "save_workflow_run"):
+                repository.save_workflow_run(self.orchestration.state.graph.workflow_run)
+            else:
+                repository.save_graph(self.orchestration.state.graph)
+                self._last_persisted_graph_signature = graph_signature
+                full_graph_sync = True
 
-        if full_graph_sync:
-            repository.save_graph(self.orchestration.state.graph)
-            self._last_persisted_graph_signature = graph_signature
-        elif hasattr(repository, "save_workflow_run"):
-            repository.save_workflow_run(self.orchestration.state.graph.workflow_run)
-        else:
-            repository.save_graph(self.orchestration.state.graph)
-            self._last_persisted_graph_signature = graph_signature
-            full_graph_sync = True
-
-        if not full_graph_sync:
-            for task in tasks:
-                repository.save_task(task)
-        for attempt in attempts:
-            repository.save_attempt(attempt)
-        for request in human_requests:
-            if hasattr(repository, "save_human_request"):
-                repository.save_human_request(request)
-        for request in approval_requests:
-            if hasattr(repository, "save_approval_request"):
-                repository.save_approval_request(request)
+            if not full_graph_sync:
+                for task in tasks:
+                    repository.save_task(task)
+            for attempt in attempts:
+                repository.save_attempt(attempt)
+            for request in human_requests:
+                if hasattr(repository, "save_human_request"):
+                    repository.save_human_request(request)
+            for request in approval_requests:
+                if hasattr(repository, "save_approval_request"):
+                    repository.save_approval_request(request)
 
     def _publish_lifecycle_event(
         self,
@@ -502,34 +535,35 @@ class LocalRuntime:
         route_model_name: str | None = None,
         route_reason: str | None = None,
     ) -> EventRecord:
-        event = self.event_service.publish(
-            make_event(
-                workflow_run_id=task.workflow_run_id,
-                task_id=task.id,
-                task_attempt_id=attempt.id,
-                agent_role=task.assigned_role,
-                provider_name=self.vertex_config.provider_name,
-                model_name=route_model_name or attempt.compiled_worker_config_json.get("model_name"),
-                route_reason=route_reason or str(attempt.compiled_worker_config_json.get("route_reason", "")),
-                event_type=event_type,
-                source=source,
-                payload_json=payload_json or {},
-                sandbox_id=attempt.workspace_id,
-            ),
-            correlation=EventCorrelationContext(
-                workflow_run_id=task.workflow_run_id,
-                task_id=task.id,
-                task_attempt_id=attempt.id,
-                agent_role=task.assigned_role,
-                provider_name=self.vertex_config.provider_name,
-                model_name=route_model_name or attempt.compiled_worker_config_json.get("model_name"),
-                route_reason=route_reason or str(attempt.compiled_worker_config_json.get("route_reason", "")),
-                sandbox_id=attempt.workspace_id,
-            ),
-        )
-        if hasattr(self.storage.workflow_repository, "save_event"):
-            self.storage.workflow_repository.save_event(event)
-        return event
+        with self._runtime_lock:
+            event = self.event_service.publish(
+                make_event(
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.id,
+                    task_attempt_id=attempt.id,
+                    agent_role=task.assigned_role,
+                    provider_name=self.vertex_config.provider_name,
+                    model_name=route_model_name or attempt.compiled_worker_config_json.get("model_name"),
+                    route_reason=route_reason or str(attempt.compiled_worker_config_json.get("route_reason", "")),
+                    event_type=event_type,
+                    source=source,
+                    payload_json=payload_json or {},
+                    sandbox_id=attempt.workspace_id,
+                ),
+                correlation=EventCorrelationContext(
+                    workflow_run_id=task.workflow_run_id,
+                    task_id=task.id,
+                    task_attempt_id=attempt.id,
+                    agent_role=task.assigned_role,
+                    provider_name=self.vertex_config.provider_name,
+                    model_name=route_model_name or attempt.compiled_worker_config_json.get("model_name"),
+                    route_reason=route_reason or str(attempt.compiled_worker_config_json.get("route_reason", "")),
+                    sandbox_id=attempt.workspace_id,
+                ),
+            )
+            if hasattr(self.storage.workflow_repository, "save_event"):
+                self.storage.workflow_repository.save_event(event)
+            return event
 
     def _normalize_stream_events(
         self,
@@ -549,13 +583,14 @@ class LocalRuntime:
         *,
         payload: Any | None = None,
     ) -> ArtifactRecord:
-        registry = self.storage.artifact_registry
-        if payload is None:
-            return registry.put_artifact(artifact)
-        try:
-            return registry.put_artifact(artifact, payload=payload)  # type: ignore[call-arg]
-        except TypeError:
-            return registry.put_artifact(artifact)
+        with self._runtime_lock:
+            registry = self.storage.artifact_registry
+            if payload is None:
+                return registry.put_artifact(artifact)
+            try:
+                return registry.put_artifact(artifact, payload=payload)  # type: ignore[call-arg]
+            except TypeError:
+                return registry.put_artifact(artifact)
 
     def _conversation_summary(self, events: Iterable[OpenHandsStreamEvent], execution_status: str) -> str:
         messages = [event.message.strip() for event in events if event.message.strip()]
@@ -618,6 +653,43 @@ class LocalRuntime:
         updated[terminal_index] = replacement
         return updated
 
+    def _retry_policy_max_attempts(self) -> int:
+        raw_value = self.runtime_config.retry_policy.get("max_attempts", 1)
+        try:
+            return max(1, int(raw_value))
+        except (TypeError, ValueError):
+            return 1
+
+    def _retry_policy_backoff_seconds(self) -> float:
+        raw_value = self.runtime_config.retry_policy.get("backoff_seconds", 0)
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _retryable_failure_reason(self, events: Iterable[OpenHandsStreamEvent]) -> str | None:
+        for event in reversed(tuple(events)):
+            if event.payload_json.get("diagnostic_code") == "worker_empty_response_loop":
+                return event.message or "worker_empty_response_loop"
+        return None
+
+    def _semantic_manager_clarification(
+        self,
+        *,
+        task: TaskRecord,
+        stream_event: OpenHandsStreamEvent,
+    ) -> str | None:
+        if task.assigned_role != "manager":
+            return None
+        if stream_event.requires_human or stream_event.approval_required:
+            return None
+        if stream_event.event_type not in {"message", "complete"}:
+            return None
+        questions = extract_semantic_clarification_questions(stream_event.message)
+        if not questions:
+            return None
+        return "\n".join(questions)
+
     def _collect_openhands_stream(
         self,
         *,
@@ -658,13 +730,45 @@ class LocalRuntime:
                     )
                 ], ()
 
+        poll_timeout_seconds = float(self.settings.autoweave_openhands_poll_timeout_seconds)
+        poll_interval_seconds = float(self.settings.autoweave_openhands_poll_interval_seconds)
         final_info = self.openhands_client.wait_for_conversation(
             conversation_id,
-            timeout_seconds=float(self.settings.autoweave_openhands_poll_timeout_seconds),
-            poll_interval_seconds=float(self.settings.autoweave_openhands_poll_interval_seconds),
+            timeout_seconds=poll_timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
         )
+        if self._should_retry_openhands_poll(final_info):
+            retry_timeout_seconds = min(60.0, max(10.0, poll_interval_seconds * 5.0))
+            self._publish_lifecycle_event(
+                task=task,
+                attempt=attempt,
+                event_type="attempt.poll_retry",
+                source="orchestrator",
+                payload_json={
+                    "conversation_id": conversation_id,
+                    "initial_error": final_info.error,
+                    "retry_timeout_seconds": retry_timeout_seconds,
+                },
+            )
+            retry_info = self.openhands_client.wait_for_conversation(
+                conversation_id,
+                timeout_seconds=retry_timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+            final_info = retry_info
         event_payloads = self.openhands_client.list_all_conversation_events(conversation_id)
         normalized.extend(extract_openhands_stream_events({"items": event_payloads}))
+        refreshed_info = self.openhands_client.get_conversation(conversation_id)
+        terminal_statuses = {"finished", "error", "stuck", "paused", "waiting_for_confirmation"}
+        if (
+            refreshed_info.ok
+            and refreshed_info.execution_status
+            and (
+                final_info.execution_status not in terminal_statuses
+                or refreshed_info.execution_status in terminal_statuses
+            )
+        ):
+            final_info = refreshed_info
         execution_status = (
             final_info.execution_status
             or bootstrap_call.execution_status
@@ -676,6 +780,12 @@ class LocalRuntime:
             execution_status=execution_status,
             model_name=str(attempt.compiled_worker_config_json.get("model_name", "")),
         )
+        has_terminal_success = any(
+            event.outcome in {"success", "succeeded", "complete", "completed"}
+            or event.event_type in {"complete", "completed", "final"}
+            for event in normalized
+        )
+        has_terminal_pause = any(event.requires_human or event.approval_required for event in normalized)
 
         if not normalized:
             if execution_status == "finished":
@@ -708,6 +818,26 @@ class LocalRuntime:
                         terminal=True,
                     )
                 )
+        elif execution_status == "finished" and not has_terminal_success:
+            normalized.append(
+                OpenHandsStreamEvent(
+                    event_type="complete",
+                    message="conversation finished",
+                    payload_json={"conversation_id": conversation_id, "execution_status": execution_status},
+                    outcome="success",
+                    terminal=True,
+                )
+            )
+        elif execution_status in {"paused", "waiting_for_confirmation"} and not has_terminal_pause:
+            normalized.append(
+                OpenHandsStreamEvent(
+                    event_type="paused",
+                    message=f"conversation {execution_status}",
+                    payload_json={"conversation_id": conversation_id, "execution_status": execution_status},
+                    approval_required=(execution_status == "waiting_for_confirmation"),
+                    requires_human=(execution_status == "paused"),
+                )
+            )
         elif final_info.error is not None and all(event.outcome not in {"error", "timeout"} for event in normalized):
             normalized.append(
                 OpenHandsStreamEvent(
@@ -726,13 +856,14 @@ class LocalRuntime:
             "conversation": final_info.response_json,
             "events": event_payloads,
         }
-        self.observability.record_debug_artifact(
-            workflow_run_id=task.workflow_run_id,
-            task_id=task.id,
-            task_attempt_id=attempt.id,
-            name="openhands.conversation",
-            payload_json=debug_payload,
-        )
+        with self._runtime_lock:
+            self.observability.record_debug_artifact(
+                workflow_run_id=task.workflow_run_id,
+                task_id=task.id,
+                task_attempt_id=attempt.id,
+                name="openhands.conversation",
+                payload_json=debug_payload,
+            )
         replay_artifact = ArtifactRecord(
             workflow_run_id=task.workflow_run_id,
             task_id=task.id,
@@ -756,6 +887,14 @@ class LocalRuntime:
         stored_replay = self._put_artifact(replay_artifact, payload=debug_payload)
         return normalized, (stored_replay.id,)
 
+    def _should_retry_openhands_poll(self, final_info: OpenHandsServiceCall) -> bool:
+        error_text = (final_info.error or "").strip().lower()
+        if "timed out" not in error_text:
+            return False
+        if final_info.execution_status in {"finished", "error", "stuck", "paused", "waiting_for_confirmation"}:
+            return False
+        return True
+
     def _process_openhands_stream(
         self,
         *,
@@ -770,6 +909,23 @@ class LocalRuntime:
         latest_message = ""
         latest_terminal_message = ""
         for stream_event in stream_events:
+            semantic_question = self._semantic_manager_clarification(
+                task=current_task,
+                stream_event=stream_event,
+            )
+            if semantic_question is not None:
+                stream_event = replace(
+                    stream_event,
+                    event_type="clarification",
+                    message=semantic_question,
+                    payload_json={
+                        **stream_event.payload_json,
+                        "semantic_clarification": True,
+                        "context_summary": stream_event.message,
+                    },
+                    terminal=True,
+                    requires_human=True,
+                )
             emitted_types.append(stream_event.event_type)
             if stream_event.message.strip():
                 latest_message = stream_event.message.strip()
@@ -884,11 +1040,12 @@ class LocalRuntime:
                 )
                 self._sync_canonical_state()
             elif outcome in {"failure", "failed", "error"}:
+                recoverable_failure = stream_event.payload_json.get("diagnostic_code") == "worker_empty_response_loop"
                 current_task, current_attempt = self.orchestration.finalize_attempt_failure(
                     current_task.id,
                     current_attempt.id,
                     reason=stream_event.message or outcome or "worker_failure",
-                    recoverable=False,
+                    recoverable=recoverable_failure,
                 )
                 self._sync_canonical_state()
             elif stream_event.event_type == "progress":
@@ -915,10 +1072,11 @@ class LocalRuntime:
         task = self._prepare_task_for_dispatch(task)
         template = self._task_template(task.task_key)
         agent_definition = self.agent_definition(task.assigned_role)
-        attempt = self.orchestration.open_attempt(
-            task_id=task.id,
-            agent_definition_id=f"{task.assigned_role}-agent",
-        )
+        with self._runtime_lock:
+            attempt = self.orchestration.open_attempt(
+                task_id=task.id,
+                agent_definition_id=f"{task.assigned_role}-agent",
+            )
         route_hints = list(dict.fromkeys([*template.route_hints, *agent_definition.model_profile_hints]))
         route = self.router.select_route(task=task, attempt=attempt, hints=route_hints)
         workspace_reservation = self.worker_adapter.reserve_workspace(attempt=attempt)
@@ -935,17 +1093,18 @@ class LocalRuntime:
             **launch_payload,
             "workspace_path": self._worker_workspace_path(attempt.id),
         }
-        attempt = self.orchestration.record_attempt(
-            attempt.model_copy(
-                update={
-                    "workspace_id": workspace_reservation.sandbox_id,
-                    "lease_key": f"lease:{attempt.id}",
-                    "model_route_id": route.id,
-                    "compiled_worker_config_json": launch_payload,
-                }
+        with self._runtime_lock:
+            attempt = self.orchestration.record_attempt(
+                attempt.model_copy(
+                    update={
+                        "workspace_id": workspace_reservation.sandbox_id,
+                        "lease_key": f"lease:{attempt.id}",
+                        "model_route_id": route.id,
+                        "compiled_worker_config_json": launch_payload,
+                    }
+                )
             )
-        )
-        self._sync_canonical_state()
+            self._sync_canonical_state()
         self._publish_lifecycle_event(
             task=task,
             attempt=attempt,
@@ -961,13 +1120,15 @@ class LocalRuntime:
             route_reason=route.route_reason,
         )
         health = self.openhands_client.health_probe()
-        published_event = self.event_service.publish_route(route)
+        with self._runtime_lock:
+            published_event = self.event_service.publish_route(route)
         bootstrap_call = None
         processed_stream_events: tuple[str, ...] = ()
         artifact_ids: tuple[str, ...] = ()
         failure_reason: str | None = None
-        final_task = self.orchestration.state.task(task.id)
-        final_attempt = self.orchestration.state.attempt(attempt.id)
+        with self._runtime_lock:
+            final_task = self.orchestration.state.task(task.id)
+            final_attempt = self.orchestration.state.attempt(attempt.id)
         approval_requirements = list(template.approval_requirements)
         if dispatch and self._approval_policy_requires_pre_dispatch(
             task=task,
@@ -979,12 +1140,13 @@ class LocalRuntime:
                 approval_requirements=approval_requirements,
                 agent_definition=agent_definition,
             )
-            self.orchestration.request_approval(
-                task_id=task.id,
-                task_attempt_id=attempt.id,
-                approval_type=approval_requirements[0] if approval_requirements else "operator_confirmation",
-                reason=approval_reason,
-            )
+            with self._runtime_lock:
+                self.orchestration.request_approval(
+                    task_id=task.id,
+                    task_attempt_id=attempt.id,
+                    approval_type=approval_requirements[0] if approval_requirements else "operator_confirmation",
+                    reason=approval_reason,
+                )
             self._publish_lifecycle_event(
                 task=task,
                 attempt=attempt,
@@ -994,9 +1156,10 @@ class LocalRuntime:
                 route_model_name=route.model_name,
                 route_reason=route.route_reason,
             )
-            self._sync_canonical_state()
-            final_task = self.orchestration.state.task(task.id)
-            final_attempt = self.orchestration.state.attempt(attempt.id)
+            with self._runtime_lock:
+                self._sync_canonical_state()
+                final_task = self.orchestration.state.task(task.id)
+                final_attempt = self.orchestration.state.attempt(attempt.id)
             return LocalTaskRunReport(
                 workflow_run_id=final_task.workflow_run_id,
                 task_key=final_task.task_key,
@@ -1019,7 +1182,8 @@ class LocalRuntime:
                 int(self.settings.autoweave_lease_ttl_seconds),
                 value={"attempt_id": attempt.id, "task_id": task.id},
             ):
-                final_attempt = self.orchestration.abort_attempt(attempt.id)
+                with self._runtime_lock:
+                    final_attempt = self.orchestration.abort_attempt(attempt.id)
                 self._publish_lifecycle_event(
                     task=final_task,
                     attempt=final_attempt,
@@ -1029,7 +1193,8 @@ class LocalRuntime:
                     route_model_name=route.model_name,
                     route_reason=route.route_reason,
                 )
-                self._sync_canonical_state()
+                with self._runtime_lock:
+                    self._sync_canonical_state()
                 return LocalTaskRunReport(
                     workflow_run_id=final_task.workflow_run_id,
                     task_key=final_task.task_key,
@@ -1049,8 +1214,9 @@ class LocalRuntime:
                 attempt.lease_key or self.storage.redis_wire.lease_key(attempt.id),
                 int(self.settings.autoweave_lease_ttl_seconds),
             ):
-                final_attempt = self.orchestration.abort_attempt(attempt.id)
-                final_task = self.orchestration.block_task(task.id, reason="lease_unavailable")
+                with self._runtime_lock:
+                    final_attempt = self.orchestration.abort_attempt(attempt.id)
+                    final_task = self.orchestration.block_task(task.id, reason="lease_unavailable")
                 self._publish_lifecycle_event(
                     task=final_task,
                     attempt=final_attempt,
@@ -1060,7 +1226,8 @@ class LocalRuntime:
                     route_model_name=route.model_name,
                     route_reason=route.route_reason,
                 )
-                self._sync_canonical_state()
+                with self._runtime_lock:
+                    self._sync_canonical_state()
                 return LocalTaskRunReport(
                     workflow_run_id=final_task.workflow_run_id,
                     task_key=final_task.task_key,
@@ -1076,10 +1243,11 @@ class LocalRuntime:
                     artifact_ids=(),
                     failure_reason="lease_unavailable",
                 )
-            final_task = self.orchestration.start_task(task.id)
-            final_attempt = self.orchestration.dispatch_attempt(attempt.id)
-            final_attempt = self.orchestration.start_attempt(attempt.id)
-            self._sync_canonical_state()
+            with self._runtime_lock:
+                final_task = self.orchestration.start_task(task.id)
+                final_attempt = self.orchestration.dispatch_attempt(attempt.id)
+                final_attempt = self.orchestration.start_attempt(attempt.id)
+                self._sync_canonical_state()
             try:
                 bootstrap_call = self.openhands_client.bootstrap_attempt(launch_payload)
                 self.storage.lease_manager.heartbeat(
@@ -1118,21 +1286,62 @@ class LocalRuntime:
                         )
                         artifact_ids = tuple((*artifact_ids, *replay_artifact_ids))
                         self._sync_canonical_state()
+                        retryable_reason = self._retryable_failure_reason(combined_stream)
+                        max_attempts = self._retry_policy_max_attempts()
+                        if (
+                            dispatch
+                            and retryable_reason is not None
+                            and final_task.state == TaskState.BLOCKED
+                            and final_attempt.state == AttemptState.ORPHANED
+                            and final_attempt.attempt_number < max_attempts
+                        ):
+                            backoff_seconds = self._retry_policy_backoff_seconds()
+                            self._publish_lifecycle_event(
+                                task=final_task,
+                                attempt=final_attempt,
+                                event_type="attempt.retry_scheduled",
+                                source="orchestrator",
+                                payload_json={
+                                    "reason": retryable_reason,
+                                    "attempt_number": final_attempt.attempt_number,
+                                    "max_attempts": max_attempts,
+                                    "backoff_seconds": backoff_seconds,
+                                },
+                                route_model_name=route.model_name,
+                                route_reason=route.route_reason,
+                            )
+                            if backoff_seconds > 0:
+                                time.sleep(backoff_seconds)
+                            retry_task = self.orchestration.unblock_task(final_task.id)
+                            self._sync_canonical_state()
+                            retry_report = self._run_task(
+                                task=retry_task,
+                                dispatch=dispatch,
+                                stream_events=stream_events,
+                            )
+                            return replace(
+                                retry_report,
+                                stream_event_types=tuple((*processed_stream_events, *retry_report.stream_event_types)),
+                                artifact_ids=tuple((*artifact_ids, *retry_report.artifact_ids)),
+                            )
                     else:
                         artifact_ids = replay_artifact_ids
                 else:
-                    final_task, final_attempt = self.orchestration.finalize_attempt_failure(
-                        task.id,
-                        attempt.id,
-                        reason=bootstrap_call.error or bootstrap_call.response_text or "openhands bootstrap failed",
-                        recoverable=False,
-                    )
+                    with self._runtime_lock:
+                        final_task, final_attempt = self.orchestration.finalize_attempt_failure(
+                            task.id,
+                            attempt.id,
+                            reason=bootstrap_call.error or bootstrap_call.response_text or "openhands bootstrap failed",
+                            recoverable=False,
+                        )
                     failure_reason = bootstrap_call.error or bootstrap_call.response_text or "openhands bootstrap failed"
-                    self._sync_canonical_state()
+                    with self._runtime_lock:
+                        self._sync_canonical_state()
             finally:
                 self.storage.lease_manager.release(attempt.lease_key or self.storage.redis_wire.lease_key(attempt.id))
         else:
-            self._sync_canonical_state()
+            with self._runtime_lock:
+                self._sync_canonical_state()
         return LocalTaskRunReport(
             workflow_run_id=final_task.workflow_run_id,
             task_key=final_task.task_key,
@@ -1171,6 +1380,8 @@ class LocalRuntime:
             artifact_store_path=self.settings.artifact_store_path(),
             openhands_target=self.settings.openhands_target().base_url,
             openhands_health=self.openhands_client.health_probe(),
+            openhands_worker_timeout_seconds=self.settings.openhands_worker_timeout_seconds,
+            openhands_poll_timeout_seconds=self.settings.autoweave_openhands_poll_timeout_seconds,
             ready_task_keys=ready_task_keys,
         )
 
@@ -1381,54 +1592,139 @@ class LocalRuntime:
         max_steps: int,
         stream_events_by_task: Mapping[str, Iterable[Mapping[str, Any] | OpenHandsStreamEvent]] | None = None,
     ) -> LocalWorkflowRunReport:
-        step_reports: list[LocalTaskRunReport] = []
+        step_reports_by_index: dict[int, LocalTaskRunReport] = {}
         remaining_steps = 1 if not dispatch else max(1, max_steps)
 
-        while remaining_steps > 0:
-            schedule = self.orchestration.schedule()
-            if not schedule.ready_tasks:
-                break
-            stop_after_iteration = False
-            for task_id in list(schedule.ready_tasks):
-                task = self.orchestration.state.task(task_id)
-                task_stream = None
-                if stream_events_by_task is not None:
-                    task_stream = stream_events_by_task.get(task.task_key)
+        if not dispatch:
+            launch_index = 0
+            while remaining_steps > 0:
+                with self._runtime_lock:
+                    schedule = self.orchestration.schedule()
+                    if not schedule.ready_tasks:
+                        break
+                    task = self.orchestration.state.task(schedule.ready_tasks[0])
+                    task_stream = None
+                    if stream_events_by_task is not None:
+                        task_stream = stream_events_by_task.get(task.task_key)
                 step_report = self._run_task(task=task, dispatch=dispatch, stream_events=task_stream)
-                step_reports.append(step_report)
+                step_reports_by_index[launch_index] = step_report
+                launch_index += 1
                 remaining_steps -= 1
                 if step_report.attempt_state in {"needs_input", "paused"} or step_report.task_state in {
                     "waiting_for_human",
                     "waiting_for_approval",
                 }:
-                    stop_after_iteration = True
                     break
-                if not dispatch or remaining_steps <= 0:
-                    stop_after_iteration = True
-                    break
-            if stop_after_iteration:
-                break
+            with self._runtime_lock:
+                final_schedule = self.orchestration.schedule()
+                open_human_questions = tuple(
+                    request.question
+                    for request in self.orchestration.state.human_requests.values()
+                    if request.status.value == "open"
+                )
+                open_approval_reasons = tuple(
+                    request.reason
+                    for request in self.orchestration.state.approval_requests.values()
+                    if request.status.value == "requested"
+                )
+            ordered_reports = tuple(step_reports_by_index[index] for index in sorted(step_reports_by_index))
+            with self._runtime_lock:
+                workflow_run_id = self.orchestration.state.graph.workflow_run.id
+                workflow_status = self.orchestration.state.graph.workflow_run.status.value
+                ready_task_keys = tuple(
+                    self.orchestration.state.task(task_id).task_key for task_id in final_schedule.ready_tasks
+                )
+            return LocalWorkflowRunReport(
+                workflow_run_id=workflow_run_id,
+                request=request,
+                workflow_status=workflow_status,
+                dispatched_task_keys=tuple(step.task_key for step in ordered_reports),
+                ready_task_keys=ready_task_keys,
+                open_human_questions=open_human_questions,
+                open_approval_reasons=open_approval_reasons,
+                step_reports=ordered_reports,
+            )
 
-        final_schedule = self.orchestration.schedule()
-        open_human_questions = tuple(
-            request.question
-            for request in self.orchestration.state.human_requests.values()
-            if request.status.value == "open"
-        )
-        open_approval_reasons = tuple(
-            request.reason
-            for request in self.orchestration.state.approval_requests.values()
-            if request.status.value == "requested"
-        )
+        max_parallel_dispatches = self._max_parallel_dispatches()
+        running_futures: dict[Future[LocalTaskRunReport], tuple[int, str]] = {}
+        next_launch_index = 0
+        stop_launching = False
+
+        with ThreadPoolExecutor(max_workers=max_parallel_dispatches) as executor:
+            while remaining_steps > 0 or running_futures:
+                if not stop_launching and remaining_steps > 0:
+                    running_task_ids = {task_id for _, task_id in running_futures.values()}
+                    with self._runtime_lock:
+                        schedule = self.orchestration.schedule()
+                        active_attempt_count = len(self.orchestration.active_attempts())
+                        ready_task_ids = [
+                            task_id
+                            for task_id in schedule.ready_tasks
+                            if task_id not in running_task_ids
+                        ]
+                    available_capacity = max(
+                        0,
+                        max_parallel_dispatches - max(len(running_futures), active_attempt_count),
+                    )
+                    for task_id in ready_task_ids[:available_capacity]:
+                        if remaining_steps <= 0:
+                            break
+                        with self._runtime_lock:
+                            task = self.orchestration.state.task(task_id)
+                            if task.state != TaskState.READY:
+                                continue
+                            task_stream = None
+                            if stream_events_by_task is not None:
+                                task_stream = stream_events_by_task.get(task.task_key)
+                        future = executor.submit(
+                            self._run_task,
+                            task=task,
+                            dispatch=True,
+                            stream_events=task_stream,
+                        )
+                        running_futures[future] = (next_launch_index, task.id)
+                        next_launch_index += 1
+                        remaining_steps -= 1
+                if not running_futures:
+                    break
+                completed, _ = wait(tuple(running_futures), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    launch_index, _task_id = running_futures.pop(future)
+                    step_report = future.result()
+                    step_reports_by_index[launch_index] = step_report
+                    if step_report.attempt_state in {"needs_input", "paused"} or step_report.task_state in {
+                        "waiting_for_human",
+                        "waiting_for_approval",
+                    }:
+                        stop_launching = True
+
+        with self._runtime_lock:
+            final_schedule = self.orchestration.schedule()
+            open_human_questions = tuple(
+                request.question
+                for request in self.orchestration.state.human_requests.values()
+                if request.status.value == "open"
+            )
+            open_approval_reasons = tuple(
+                request.reason
+                for request in self.orchestration.state.approval_requests.values()
+                if request.status.value == "requested"
+            )
+            workflow_run_id = self.orchestration.state.graph.workflow_run.id
+            workflow_status = self.orchestration.state.graph.workflow_run.status.value
+            ready_task_keys = tuple(
+                self.orchestration.state.task(task_id).task_key for task_id in final_schedule.ready_tasks
+            )
+        ordered_reports = tuple(step_reports_by_index[index] for index in sorted(step_reports_by_index))
         return LocalWorkflowRunReport(
-            workflow_run_id=self.orchestration.state.graph.workflow_run.id,
+            workflow_run_id=workflow_run_id,
             request=request,
-            workflow_status=self.orchestration.state.graph.workflow_run.status.value,
-            dispatched_task_keys=tuple(step.task_key for step in step_reports),
-            ready_task_keys=tuple(self.orchestration.state.task(task_id).task_key for task_id in final_schedule.ready_tasks),
+            workflow_status=workflow_status,
+            dispatched_task_keys=tuple(step.task_key for step in ordered_reports),
+            ready_task_keys=ready_task_keys,
             open_human_questions=open_human_questions,
             open_approval_reasons=open_approval_reasons,
-            step_reports=tuple(step_reports),
+            step_reports=ordered_reports,
         )
 
 
