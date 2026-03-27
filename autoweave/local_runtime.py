@@ -18,9 +18,11 @@ from autoweave.models import (
     AttemptState,
     ArtifactRecord,
     ArtifactStatus,
+    EdgeType,
     EventRecord,
     MemoryEntryRecord,
     MemoryLayer,
+    TaskEdgeRecord,
     TaskAttemptRecord,
     TaskRecord,
     TaskState,
@@ -44,7 +46,15 @@ from autoweave.workers.runtime import (
     WorkspacePolicy,
 )
 from autoweave.workflows import build_workflow_graph
-from autoweave.config_models import AgentDefinitionConfig, ObservabilityConfig, RuntimeConfig, StorageConfig, VertexConfig, WorkflowDefinitionConfig
+from autoweave.config_models import (
+    AgentDefinitionConfig,
+    ObservabilityConfig,
+    RuntimeConfig,
+    StorageConfig,
+    TaskTemplateConfig,
+    VertexConfig,
+    WorkflowDefinitionConfig,
+)
 from autoweave.events.schema import EventCorrelationContext, make_event
 from autoweave.types import JsonDict
 
@@ -365,6 +375,28 @@ class LocalRuntime:
         with self._runtime_lock:
             return str(self.orchestration.state.graph.workflow_run.root_input_json.get("user_request", "")).strip()
 
+    def _autonomy_level(self) -> str:
+        level = self.settings.autoweave_autonomy_level.strip().lower()
+        if level not in {"low", "medium", "high"}:
+            return "medium"
+        return level
+
+    def _operator_policy(self, task: TaskRecord) -> dict[str, str]:
+        autonomy_level = self._autonomy_level()
+        if task.assigned_role == "manager":
+            if autonomy_level == "low":
+                clarification_expectation = "ask_for_human_input_on_minor_scope_uncertainty"
+            elif autonomy_level == "high":
+                clarification_expectation = "ask_for_human_input_only_on_hard_blockers"
+            else:
+                clarification_expectation = "ask_for_human_input_on_material_scope_gaps"
+        else:
+            clarification_expectation = "follow_manager_scope_and_only_escalate_true_blockers"
+        return {
+            "autonomy_level": autonomy_level,
+            "clarification_expectation": clarification_expectation,
+        }
+
     @staticmethod
     def _truncate_text(value: str, *, max_chars: int = 600) -> str:
         normalized = " ".join(str(value).split()).strip()
@@ -373,7 +405,7 @@ class LocalRuntime:
         return normalized[: max_chars - 3].rstrip() + "..."
 
     def _memory_scopes_for_task(self, task: TaskRecord) -> tuple[str, ...]:
-        template = self._task_template(task.task_key)
+        template = self._task_template(task.task_key, task)
         agent_definition = self.agent_definition(task.assigned_role)
         seen: set[str] = set()
         scopes: list[str] = []
@@ -520,6 +552,7 @@ class LocalRuntime:
         with self._runtime_lock:
             merged_input = dict(self.orchestration.state.graph.workflow_run.root_input_json)
             merged_input.update(task.input_json)
+            merged_input["operator_policy"] = self._operator_policy(task)
             workflow_request = self._workflow_request()
             if workflow_request and not str(merged_input.get("user_request", "")).strip():
                 merged_input["user_request"] = workflow_request
@@ -639,8 +672,32 @@ class LocalRuntime:
         self.orchestration = OrchestrationService(WorkflowRunState.from_graph(canonical_graph))
         self._last_persisted_graph_signature = self._graph_structure_signature()
 
-    def _task_template(self, task_key: str):
-        return next(template for template in self.workflow_definition.task_templates if template.key == task_key)
+    def _task_template(self, task_key: str, task: TaskRecord | None = None) -> TaskTemplateConfig:
+        for template in self.workflow_definition.task_templates:
+            if template.key == task_key:
+                return template
+        if task is None:
+            task = self.orchestration.state.task(task_key)
+        input_json = task.input_json
+        return TaskTemplateConfig(
+            key=task.task_key,
+            title=task.title,
+            assigned_role=task.assigned_role,
+            description_template=task.description,
+            hard_dependencies=[],
+            soft_dependencies=[],
+            required_artifacts=list(task.required_artifact_types_json),
+            produced_artifacts=list(task.produced_artifact_types_json),
+            approval_requirements=list(input_json.get("_template_approval_requirements", []))
+            if isinstance(input_json.get("_template_approval_requirements"), list)
+            else [],
+            memory_scopes=list(input_json.get("_template_memory_scopes", []))
+            if isinstance(input_json.get("_template_memory_scopes"), list)
+            else [],
+            route_hints=list(input_json.get("_template_route_hints", []))
+            if isinstance(input_json.get("_template_route_hints"), list)
+            else [],
+        )
 
     def _sync_canonical_state(self) -> None:
         """Persist the authoritative orchestration snapshot through the repository wiring."""
@@ -920,7 +977,234 @@ class LocalRuntime:
         questions = extract_semantic_clarification_questions(stream_event.message)
         if not questions:
             return None
+        autonomy_level = self._autonomy_level()
+        if autonomy_level == "high":
+            lower_message = stream_event.message.lower()
+            hard_blocker_markers = (
+                "cannot proceed",
+                "can't proceed",
+                "blocked until",
+                "must know",
+                "required before i continue",
+                "need this to continue",
+            )
+            if not any(marker in lower_message for marker in hard_blocker_markers):
+                return None
         return "\n".join(questions)
+
+    def _task_artifacts(self, task: TaskRecord) -> list[ArtifactRecord]:
+        repository = self.storage.workflow_repository
+        if hasattr(repository, "list_artifacts_for_task"):
+            try:
+                return list(repository.list_artifacts_for_task(task.id))
+            except KeyError:
+                return []
+        return []
+
+    def _review_feedback_text(self, task: TaskRecord) -> str:
+        candidates: list[str] = []
+        for artifact in self._task_artifacts(task):
+            if artifact.artifact_type != "review_notes" or artifact.status != ArtifactStatus.FINAL:
+                continue
+            summary = artifact.summary.strip()
+            if summary:
+                candidates.append(summary)
+        result_summary = str(task.output_json.get("result_summary", "")).strip()
+        if result_summary:
+            candidates.append(result_summary)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            deduped.append(candidate)
+            seen.add(key)
+        return "\n\n".join(deduped)
+
+    @staticmethod
+    def _review_decision(review_feedback: str) -> str:
+        lower_feedback = review_feedback.strip().lower()
+        if not lower_feedback:
+            return "approve"
+        if "review_decision: revise" in lower_feedback:
+            return "revise"
+        if "review_decision: approve" in lower_feedback:
+            return "approve"
+        approve_cues = (
+            "no blocking issues",
+            "ready to ship",
+            "recommendation: approve",
+        )
+        if any(cue in lower_feedback for cue in approve_cues):
+            return "approve"
+        revise_cues = (
+            "changes requested",
+            "recommendation: revise",
+            "needs rework",
+            "must fix",
+            "not ready to ship",
+            "before release",
+            "blocking issue",
+            "blocker",
+        )
+        if any(cue in lower_feedback for cue in revise_cues):
+            return "revise"
+        return "approve"
+
+    def _build_rework_task(
+        self,
+        *,
+        workflow_run_id: str,
+        task_key: str,
+        title: str,
+        description: str,
+        assigned_role: str,
+        review_feedback: str,
+        required_artifacts: list[str],
+        produced_artifacts: list[str],
+        route_hints: list[str],
+    ) -> TaskRecord:
+        return TaskRecord(
+            workflow_run_id=workflow_run_id,
+            task_key=task_key,
+            title=title,
+            description=description,
+            assigned_role=assigned_role,
+            input_json={
+                "review_feedback": review_feedback,
+                "_template_memory_scopes": ["workflow_run", "task"],
+                "_template_route_hints": route_hints,
+                "_template_approval_requirements": [],
+            },
+            required_artifact_types_json=required_artifacts,
+            produced_artifact_types_json=produced_artifacts,
+        )
+
+    def _append_review_rework_tasks(
+        self,
+        *,
+        review_task: TaskRecord,
+        review_attempt: TaskAttemptRecord,
+    ) -> tuple[str, ...]:
+        if review_task.task_key != "review":
+            return ()
+
+        review_feedback = self._review_feedback_text(review_task)
+        if self._review_decision(review_feedback) != "revise":
+            return ()
+
+        with self._runtime_lock:
+            existing_keys = {task.task_key for task in self.orchestration.state.tasks_by_id.values()}
+            if {"manager_rework", "backend_rework", "frontend_rework", "integration_rework"} & existing_keys:
+                return ()
+
+        manager_rework = self._build_rework_task(
+            workflow_run_id=review_task.workflow_run_id,
+            task_key="manager_rework",
+            title="Manager rework plan",
+            description="Turn the single review pass into a concrete rework plan and assign backend/frontend fixes without scheduling another review.",
+            assigned_role="manager",
+            review_feedback=review_feedback,
+            required_artifacts=["review_notes"],
+            produced_artifacts=["rework_plan"],
+            route_hints=["planning", "rework"],
+        )
+        backend_rework = self._build_rework_task(
+            workflow_run_id=review_task.workflow_run_id,
+            task_key="backend_rework",
+            title="Backend rework",
+            description="Apply the backend-facing fixes called out in the review notes and manager rework plan.",
+            assigned_role="backend",
+            review_feedback=review_feedback,
+            required_artifacts=["review_notes", "rework_plan"],
+            produced_artifacts=["backend_rework"],
+            route_hints=["implementation", "rework"],
+        )
+        frontend_rework = self._build_rework_task(
+            workflow_run_id=review_task.workflow_run_id,
+            task_key="frontend_rework",
+            title="Frontend rework",
+            description="Apply the frontend-facing fixes called out in the review notes and manager rework plan.",
+            assigned_role="frontend",
+            review_feedback=review_feedback,
+            required_artifacts=["review_notes", "rework_plan"],
+            produced_artifacts=["frontend_rework"],
+            route_hints=["implementation", "rework"],
+        )
+        integration_rework = self._build_rework_task(
+            workflow_run_id=review_task.workflow_run_id,
+            task_key="integration_rework",
+            title="Integration rework",
+            description="Re-integrate the backend and frontend fixes from the single review pass and produce the final handoff artifact.",
+            assigned_role="backend",
+            review_feedback=review_feedback,
+            required_artifacts=["backend_rework", "frontend_rework"],
+            produced_artifacts=["integration_rework_report"],
+            route_hints=["integration", "rework"],
+        )
+        edges = [
+            TaskEdgeRecord(
+                workflow_run_id=review_task.workflow_run_id,
+                from_task_id=review_task.id,
+                to_task_id=manager_rework.id,
+                edge_type=EdgeType.HARD,
+                is_hard_dependency=True,
+            ),
+            TaskEdgeRecord(
+                workflow_run_id=review_task.workflow_run_id,
+                from_task_id=manager_rework.id,
+                to_task_id=backend_rework.id,
+                edge_type=EdgeType.HARD,
+                is_hard_dependency=True,
+            ),
+            TaskEdgeRecord(
+                workflow_run_id=review_task.workflow_run_id,
+                from_task_id=manager_rework.id,
+                to_task_id=frontend_rework.id,
+                edge_type=EdgeType.HARD,
+                is_hard_dependency=True,
+            ),
+            TaskEdgeRecord(
+                workflow_run_id=review_task.workflow_run_id,
+                from_task_id=backend_rework.id,
+                to_task_id=integration_rework.id,
+                edge_type=EdgeType.HARD,
+                is_hard_dependency=True,
+            ),
+            TaskEdgeRecord(
+                workflow_run_id=review_task.workflow_run_id,
+                from_task_id=frontend_rework.id,
+                to_task_id=integration_rework.id,
+                edge_type=EdgeType.HARD,
+                is_hard_dependency=True,
+            ),
+        ]
+        with self._runtime_lock:
+            appended_tasks = self.orchestration.add_dynamic_tasks(
+                tasks=[manager_rework, backend_rework, frontend_rework, integration_rework],
+                edges=edges,
+            )
+        self._persist_memory_entry(
+            task=review_task,
+            content=f"Review requested rework once: {self._truncate_text(review_feedback, max_chars=900)}",
+            memory_layer=MemoryLayer.SEMANTIC,
+            metadata_json={
+                "kind": "review_rework",
+                "rework_task_keys": [task.task_key for task in appended_tasks],
+            },
+        )
+        self._publish_lifecycle_event(
+            task=review_task,
+            attempt=review_attempt,
+            event_type="workflow.rework_planned",
+            source="orchestrator",
+            payload_json={
+                "review_decision": "revise",
+                "rework_task_keys": [task.task_key for task in appended_tasks],
+            },
+        )
+        return tuple(task.task_key for task in appended_tasks)
 
     def _collect_openhands_stream(
         self,
@@ -1284,6 +1568,10 @@ class LocalRuntime:
                     memory_layer=MemoryLayer.SEMANTIC,
                     metadata_json={"kind": "task_result", "outcome": "success"},
                 )
+                self._append_review_rework_tasks(
+                    review_task=current_task,
+                    review_attempt=current_attempt,
+                )
                 if not artifact_ids and current_task.produced_artifact_types_json:
                     fallback_artifact = ArtifactRecord(
                         workflow_run_id=current_task.workflow_run_id,
@@ -1376,7 +1664,7 @@ class LocalRuntime:
         stream_events: Iterable[Mapping[str, Any] | OpenHandsStreamEvent] | None = None,
     ) -> LocalTaskRunReport:
         task = self._prepare_task_for_dispatch(task)
-        template = self._task_template(task.task_key)
+        template = self._task_template(task.task_key, task)
         agent_definition = self.agent_definition(task.assigned_role)
         with self._runtime_lock:
             attempt = self.orchestration.open_attempt(

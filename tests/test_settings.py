@@ -205,6 +205,7 @@ def test_settings_auto_select_durable_backends_when_requested(tmp_path: Path) ->
                 "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
                 "AUTOWEAVE_CANONICAL_BACKEND=auto",
                 "AUTOWEAVE_GRAPH_BACKEND=auto",
+                "AUTOWEAVE_AUTONOMY_LEVEL=high",
             ]
         )
         + "\n",
@@ -216,3 +217,4 @@ def test_settings_auto_select_durable_backends_when_requested(tmp_path: Path) ->
 
     assert settings.autoweave_canonical_backend == "postgres"
     assert settings.autoweave_graph_backend == "neo4j"
+    assert settings.autoweave_autonomy_level == "high"

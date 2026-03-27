@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from autoweave.models import ApprovalRequestRecord, HumanRequestRecord, TaskAttemptRecord, TaskRecord
+from autoweave.models import ApprovalRequestRecord, HumanRequestRecord, TaskAttemptRecord, TaskEdgeRecord, TaskRecord
 from autoweave.orchestration.scheduler import ScheduleResult, WorkflowScheduler
 from autoweave.orchestration.state import WorkflowRunState
 
@@ -155,3 +155,11 @@ class OrchestrationService:
             approved=approved,
             resolved_by=resolved_by,
         )
+
+    def add_dynamic_tasks(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        edges: list[TaskEdgeRecord],
+    ) -> tuple[TaskRecord, ...]:
+        return self.state.add_dynamic_tasks(tasks=tasks, edges=edges)

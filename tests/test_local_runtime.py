@@ -837,6 +837,62 @@ def test_local_runtime_promotes_manager_semantic_clarification_to_waiting_for_hu
     assert report.step_reports[0].task_state == "waiting_for_human"
 
 
+def test_local_runtime_high_autonomy_keeps_manager_moving_on_non_blocking_semantic_questions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(
+        root=tmp_path,
+        environ={"AUTOWEAVE_AUTONOMY_LEVEL": "high"},
+        transport=transport,
+    ) as runtime:
+        report = runtime.run_workflow(
+            request="Build a modern booking app.",
+            dispatch=True,
+            max_steps=1,
+            stream_events_by_task={
+                "manager_plan": (
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Before I proceed, I need clarification. "
+                                        "What exact thing is being booked? "
+                                        "Should payment be collected upfront?"
+                                    ),
+                                }
+                            ],
+                            "tool_calls": None,
+                        },
+                    },
+                    {
+                        "kind": "ObservationEvent",
+                        "tool_name": "finish",
+                        "observation": {
+                            "kind": "FinishObservation",
+                            "content": [{"type": "text", "text": "Planned the booking app with default assumptions."}],
+                        },
+                    },
+                ),
+            },
+        )
+
+    assert report.dispatched_task_keys == ("manager_plan",)
+    assert report.open_human_questions == ()
+    assert report.step_reports[0].task_state == "completed"
+    prompt = next(call for call in calls if call["path"] == "/api/conversations")["body"]["initial_message"]["content"][0]["text"]
+    assert '"autonomy_level": "high"' in prompt
+
+
 def test_local_runtime_can_resume_after_human_answer(tmp_path: Path, monkeypatch) -> None:
     _prepare_local_root(tmp_path)
     calls: list[dict[str, object]] = []
@@ -894,7 +950,9 @@ def test_local_runtime_can_resume_after_human_answer(tmp_path: Path, monkeypatch
     assert "Use Stripe only and ship within the US." in resumed_prompt
 
 
-def test_local_runtime_waits_for_approval_and_can_resume_after_resolution(tmp_path: Path, monkeypatch) -> None:
+def test_local_runtime_waits_for_worker_requested_approval_and_can_resume_after_resolution(
+    tmp_path: Path, monkeypatch
+) -> None:
     _prepare_local_root(tmp_path)
     calls: list[dict[str, object]] = []
     transport = _recording_transport(calls)
@@ -902,9 +960,27 @@ def test_local_runtime_waits_for_approval_and_can_resume_after_resolution(tmp_pa
     monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
     with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
         initial = runtime.run_workflow(
-            request="Build a small clothing ecommerce site with frontend, backend, integration, and review.",
+            request="Build a small clothing ecommerce site with a gated plan.",
             dispatch=True,
-            max_steps=8,
+            max_steps=1,
+            stream_events_by_task={
+                "manager_plan": (
+                    {
+                        "kind": "MessageEvent",
+                        "source": "agent",
+                        "llm_message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "APPROVAL_REQUIRED: Approve the manager plan before I dispatch the downstream implementation work.",
+                                }
+                            ],
+                            "tool_calls": None,
+                        },
+                    },
+                ),
+            },
         )
         approval_request = runtime.storage.workflow_repository.list_approval_requests_for_run(initial.workflow_run_id)[0]
         resumed = runtime.resolve_approval_request(
@@ -917,16 +993,82 @@ def test_local_runtime_waits_for_approval_and_can_resume_after_resolution(tmp_pa
         )
         updated_request = runtime.storage.workflow_repository.get_approval_request(approval_request.id)
 
-    assert initial.open_approval_reasons == ("Approval required before dispatch: human_review",)
-    assert any(step.task_key == "review" and step.task_state == "waiting_for_approval" for step in initial.step_reports)
+    assert initial.open_approval_reasons == ("Approve the manager plan before I dispatch the downstream implementation work.",)
+    assert initial.step_reports[0].attempt_state == "paused"
+    assert initial.step_reports[0].task_state == "waiting_for_approval"
     assert updated_request.status.value == "approved"
-    assert resumed.dispatched_task_keys == ("review",)
-    assert resumed.step_reports[0].task_key == "review"
+    assert resumed.dispatched_task_keys == ("manager_plan",)
+    assert resumed.step_reports[0].task_key == "manager_plan"
     assert resumed.step_reports[0].task_state == "completed"
-    assert resumed.workflow_status == "completed"
     conversation_calls = [call for call in calls if call["path"] == "/api/conversations"]
-    assert len(conversation_calls) == 6
-    assert conversation_calls[-1]["body"]["agent"]["llm"]["model"] == "vertex_ai/gemini-3-flash-preview"
+    assert len(conversation_calls) == 2
+
+
+def test_local_runtime_adds_single_review_rework_branch_without_second_review(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+
+    def fake_collect(self, *, task, attempt, bootstrap_call, stream_events):
+        if task.task_key == "review":
+            return (
+                [
+                    OpenHandsStreamEvent(event_type="progress", message="review running", outcome="running"),
+                    OpenHandsStreamEvent(
+                        event_type="complete",
+                        message="REVIEW_DECISION: REVISE. Changes requested for validation gaps and UX polish.",
+                        artifact={
+                            "artifact_type": "review_notes",
+                            "title": "Review notes",
+                            "summary": (
+                                "REVIEW_DECISION: REVISE\n"
+                                "Backend: tighten validation.\n"
+                                "Frontend: simplify loading states.\n"
+                                "Integration: verify seeded data flow."
+                            ),
+                            "status": "final",
+                            "metadata_json": {"content_type": "text/plain"},
+                        },
+                        outcome="success",
+                        terminal=True,
+                    ),
+                ],
+                (),
+            )
+        return (
+            [
+                OpenHandsStreamEvent(event_type="progress", message=f"{task.task_key} running", outcome="running"),
+                OpenHandsStreamEvent(
+                    event_type="complete",
+                    message=f"{task.task_key} completed",
+                    outcome="success",
+                    terminal=True,
+                ),
+            ],
+            (),
+        )
+
+    monkeypatch.setattr("autoweave.local_runtime.LocalRuntime._collect_openhands_stream", fake_collect)
+
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.run_workflow(
+            request="Build a serious booking app with one review pass and then rework if needed.",
+            dispatch=True,
+            max_steps=10,
+        )
+        graph = runtime.storage.workflow_repository.get_graph(report.workflow_run_id)
+
+    task_keys = [task.task_key for task in graph.tasks]
+    assert report.workflow_status == "completed"
+    assert report.dispatched_task_keys.count("review") == 1
+    assert "manager_rework" in task_keys
+    assert "backend_rework" in task_keys
+    assert "frontend_rework" in task_keys
+    assert "integration_rework" in task_keys
+    assert "review" in report.dispatched_task_keys
+    assert "integration_rework" in report.dispatched_task_keys
 
 
 def test_cli_doctor_and_run_example_use_composed_runtime(tmp_path: Path, monkeypatch) -> None:

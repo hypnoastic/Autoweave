@@ -227,6 +227,7 @@ def test_new_project_does_not_copy_live_vertex_credentials(tmp_path: Path) -> No
     env_text = (project_path / ".env.local").read_text(encoding="utf-8")
     assert "AUTOWEAVE_CANONICAL_BACKEND=auto" in env_text
     assert "AUTOWEAVE_GRAPH_BACKEND=auto" in env_text
+    assert "AUTOWEAVE_AUTONOMY_LEVEL=medium" in env_text
     gitignore_text = (project_path / ".gitignore").read_text(encoding="utf-8")
     assert "workspaces/" in gitignore_text
     assert "dist/" in gitignore_text

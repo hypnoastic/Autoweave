@@ -272,6 +272,7 @@ class LocalEnvironmentSettings(BaseModel):
     autoweave_graph_backend: str = "sqlite"
     autoweave_postgres_schema: str = "autoweave"
     autoweave_state_dir: Path = Field(default=Path("var/state"))
+    autoweave_autonomy_level: str = "medium"
 
     autoweave_max_active_attempts: int = 8
     autoweave_heartbeat_interval_seconds: int = 15
@@ -343,6 +344,7 @@ class LocalEnvironmentSettings(BaseModel):
             autoweave_graph_backend=graph_backend,
             autoweave_postgres_schema=get_env_value(env_map, "AUTOWEAVE_POSTGRES_SCHEMA", "autoweave"),
             autoweave_state_dir=Path(get_env_value(env_map, "AUTOWEAVE_STATE_DIR", "var/state")),
+            autoweave_autonomy_level=get_env_value(env_map, "AUTOWEAVE_AUTONOMY_LEVEL", "medium"),
             autoweave_max_active_attempts=int(get_env_value(env_map, "AUTOWEAVE_MAX_ACTIVE_ATTEMPTS", "8")),
             autoweave_heartbeat_interval_seconds=int(get_env_value(env_map, "AUTOWEAVE_HEARTBEAT_INTERVAL_SECONDS", "15")),
             autoweave_lease_ttl_seconds=int(get_env_value(env_map, "AUTOWEAVE_LEASE_TTL_SECONDS", "60")),

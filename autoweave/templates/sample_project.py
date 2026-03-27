@@ -94,7 +94,7 @@ def render_agent_playbook(role: str) -> str:
             "focus": [
                 "verify behavior against acceptance criteria",
                 "look for edge cases, regressions, and release blockers",
-                "summarize test status and remaining risk clearly",
+                "summarize test status, a release verdict, and concrete rework notes clearly",
             ],
             "artifact_types": ["qa_report", "review_notes", "release_risk"],
         },
@@ -267,6 +267,7 @@ def render_agent_skill_markdown(role: str, filename: str) -> str:
             "- Verify the acceptance criteria one by one.\n"
             "- Look for regressions, stale assumptions, and missing tests.\n"
             "- Record what is still blocked.\n"
+            "- Start the final verdict with `REVIEW_DECISION: APPROVE` or `REVIEW_DECISION: REVISE`.\n"
         )
     if role == "reviewer" and filename == "release_readiness.md":
         return (
@@ -275,7 +276,8 @@ def render_agent_skill_markdown(role: str, filename: str) -> str:
             "## Do\n"
             "- Confirm artifacts are final and traceable.\n"
             "- Summarize residual risk and unresolved questions.\n"
-            "- Recommend approve, revise, or stop.\n"
+            "- If revision is needed, provide detailed backend, frontend, and integration fixes in one pass.\n"
+            "- Assume the workflow will rework once from your notes and will not request a second review pass.\n"
         )
     return (
         f"# {role.title()} Skill\n\n"
@@ -409,7 +411,7 @@ def render_workflow_yaml() -> str:
                 "soft_dependencies": [],
                 "required_artifacts": ["integration_report"],
                 "produced_artifacts": ["review_notes"],
-                "approval_requirements": ["human_review"],
+                "approval_requirements": [],
                 "memory_scopes": ["workflow_run", "task"],
                 "route_hints": ["review"],
             },

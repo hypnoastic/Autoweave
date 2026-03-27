@@ -60,6 +60,51 @@ class WorkflowRunState:
         self.graph = self.graph.model_copy(update={"tasks": [self.tasks_by_id[t.id] for t in self.graph.tasks]})
         return task
 
+    def add_dynamic_tasks(
+        self,
+        *,
+        tasks: list[TaskRecord],
+        edges: list[TaskEdgeRecord],
+    ) -> tuple[TaskRecord, ...]:
+        if not tasks:
+            return ()
+
+        existing_ids = set(self.tasks_by_id)
+        existing_keys = set(self.tasks_by_key)
+        for task in tasks:
+            if task.id in existing_ids:
+                raise StateTransitionError(f"task id {task.id!r} already exists in the workflow graph")
+            if task.task_key in existing_keys:
+                raise StateTransitionError(f"task key {task.task_key!r} already exists in the workflow graph")
+
+        task_ids = {task.id for task in self.graph.tasks} | {task.id for task in tasks}
+        for edge in edges:
+            if edge.from_task_id not in task_ids or edge.to_task_id not in task_ids:
+                raise StateTransitionError("dynamic workflow edge references an unknown task")
+
+        appended_tasks = [task.model_copy(deep=True) for task in tasks]
+        appended_edges = [edge.model_copy(deep=True) for edge in edges]
+        for task in appended_tasks:
+            self.tasks_by_id[task.id] = task
+            self.tasks_by_key[task.task_key] = task.id
+
+        self.graph_revision = max(self.graph_revision, self.graph.workflow_run.graph_revision) + 1
+        workflow_run = self.graph.workflow_run.model_copy(
+            update={
+                "graph_revision": self.graph_revision,
+                "status": WorkflowRunStatus.RUNNING,
+                "ended_at": None,
+            }
+        )
+        self.graph = self.graph.model_copy(
+            update={
+                "workflow_run": workflow_run,
+                "tasks": [*self.graph.tasks, *appended_tasks],
+                "edges": [*self.graph.edges, *appended_edges],
+            }
+        )
+        return tuple(appended_tasks)
+
     def _active_attempt_states(self) -> set[AttemptState]:
         return {
             AttemptState.QUEUED,
