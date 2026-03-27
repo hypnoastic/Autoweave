@@ -102,6 +102,15 @@ def derive_openhands_poll_timeout_seconds(worker_timeout_seconds: int) -> int:
     )
 
 
+def resolve_storage_backend_mode(requested: str, *, url: str, durable: str, fallback: str) -> str:
+    """Normalize an explicit or auto-selected storage backend mode."""
+
+    normalized = requested.strip().lower()
+    if normalized in {"", "auto"}:
+        return durable if url.strip() else fallback
+    return normalized
+
+
 def ensure_vertex_credentials_layout(root: Path) -> Path:
     """Materialize the canonical Vertex service-account location for local development."""
 
@@ -295,6 +304,19 @@ class LocalEnvironmentSettings(BaseModel):
             else derive_openhands_poll_timeout_seconds(openhands_worker_timeout_seconds)
         )
 
+        canonical_backend = resolve_storage_backend_mode(
+            get_env_value(env_map, "AUTOWEAVE_CANONICAL_BACKEND", "sqlite"),
+            url=get_env_value(env_map, "POSTGRES_URL"),
+            durable="postgres",
+            fallback="sqlite",
+        )
+        graph_backend = resolve_storage_backend_mode(
+            get_env_value(env_map, "AUTOWEAVE_GRAPH_BACKEND", "sqlite"),
+            url=get_env_value(env_map, "NEO4J_URL"),
+            durable="neo4j",
+            fallback="sqlite",
+        )
+
         settings = cls(
             project_root=project_root,
             loaded_env_files=loaded_files,
@@ -317,8 +339,8 @@ class LocalEnvironmentSettings(BaseModel):
             autoweave_vertex_config=Path(get_env_value(env_map, "AUTOWEAVE_VERTEX_CONFIG", "configs/runtime/vertex.yaml")),
             autoweave_observability_config=Path(get_env_value(env_map, "AUTOWEAVE_OBSERVABILITY_CONFIG", "configs/runtime/observability.yaml")),
             autoweave_vertex_profile_override=get_env_value(env_map, "AUTOWEAVE_VERTEX_PROFILE_OVERRIDE") or None,
-            autoweave_canonical_backend=get_env_value(env_map, "AUTOWEAVE_CANONICAL_BACKEND", "sqlite"),
-            autoweave_graph_backend=get_env_value(env_map, "AUTOWEAVE_GRAPH_BACKEND", "sqlite"),
+            autoweave_canonical_backend=canonical_backend,
+            autoweave_graph_backend=graph_backend,
             autoweave_postgres_schema=get_env_value(env_map, "AUTOWEAVE_POSTGRES_SCHEMA", "autoweave"),
             autoweave_state_dir=Path(get_env_value(env_map, "AUTOWEAVE_STATE_DIR", "var/state")),
             autoweave_max_active_attempts=int(get_env_value(env_map, "AUTOWEAVE_MAX_ACTIVE_ATTEMPTS", "8")),

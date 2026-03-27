@@ -666,6 +666,44 @@ def test_local_runtime_run_workflow_propagates_request_and_advances_multiple_tas
     assert any('"upstream_artifacts"' in prompt for prompt in downstream_prompts)
 
 
+def test_local_runtime_persists_memory_and_injects_it_into_downstream_prompts(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        report = runtime.run_workflow(
+            request="Build a bookings app with a manager plan and downstream implementation.",
+            dispatch=True,
+            max_steps=2,
+        )
+        memory_entries = runtime.storage.workflow_repository.list_memory_entries("workflow_run", report.workflow_run_id)
+
+    assert any("Manager plan: task completed" == entry.content for entry in memory_entries)
+    conversation_calls = [call for call in calls if call["path"] == "/api/conversations"]
+    assert len(conversation_calls) == 2
+    downstream_prompt = conversation_calls[1]["body"]["initial_message"]["content"][0]["text"]
+    assert '"memory_context"' in downstream_prompt
+    assert "Manager plan: task completed" in downstream_prompt
+
+
+def test_local_runtime_projects_lifecycle_events_into_graph_backend(tmp_path: Path, monkeypatch) -> None:
+    _prepare_local_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    transport = _recording_transport(calls)
+
+    monkeypatch.setattr("autoweave.local_runtime.build_local_storage_wiring", _test_storage_wiring)
+    with build_local_runtime(root=tmp_path, environ={}, transport=transport) as runtime:
+        example = runtime.run_example(dispatch=True)
+        projected_events = runtime.storage.graph_projection.list_events()
+        related_entities = runtime.storage.graph_projection.query_related_entities(example.launch_payload["task_id"], depth=8)
+
+    assert projected_events
+    assert any(event.event_type == "attempt.opened" for event in projected_events)
+    assert any(relation["relation"] == "HAS_ATTEMPT" for relation in related_entities)
+
+
 def test_local_runtime_dispatches_newly_ready_backend_work_while_frontend_branch_is_still_running(
     tmp_path: Path, monkeypatch
 ) -> None:

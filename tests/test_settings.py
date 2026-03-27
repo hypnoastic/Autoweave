@@ -192,3 +192,27 @@ def test_settings_respect_explicit_openhands_poll_timeout_override(tmp_path: Pat
     settings = LocalEnvironmentSettings.load(root=tmp_path)
 
     assert settings.autoweave_openhands_poll_timeout_seconds == 120
+
+
+def test_settings_auto_select_durable_backends_when_requested(tmp_path: Path) -> None:
+    _seed_repo(tmp_path)
+    (tmp_path / ".env.local").write_text(
+        "\n".join(
+            [
+                "VERTEXAI_PROJECT=demo-project",
+                "VERTEXAI_LOCATION=global",
+                "POSTGRES_URL=postgresql://user@host/db",
+                "NEO4J_URL=neo4j+s://demo.databases.neo4j.io",
+                "AUTOWEAVE_CANONICAL_BACKEND=auto",
+                "AUTOWEAVE_GRAPH_BACKEND=auto",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "credentials.json").write_text("{}", encoding="utf-8")
+
+    settings = LocalEnvironmentSettings.load(root=tmp_path)
+
+    assert settings.autoweave_canonical_backend == "postgres"
+    assert settings.autoweave_graph_backend == "neo4j"

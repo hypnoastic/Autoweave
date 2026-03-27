@@ -69,6 +69,15 @@ class InMemoryContextService:
             return [entry.content for entry in results]
         return [result.entry.content for result in self._memory_store.search(query, scope, top_k)]
 
+    def list_memory_entries(self, scope_type: str, scope_id: str, *, limit: int | None = None) -> list:
+        if hasattr(self._workflow_repository, "list_memory_entries"):
+            entries = self._workflow_repository.list_memory_entries(scope_type, scope_id)  # type: ignore[attr-defined]
+        else:
+            entries = self._memory_store.list_scope(scope_type, scope_id)
+        if limit is not None and limit >= 0:
+            return list(entries[:limit])
+        return list(entries)
+
     def lookup_memory(self, query: str, scope: str, top_k: int) -> ContextLookupResult:
         if hasattr(self._workflow_repository, "search_memory"):
             matches = self._workflow_repository.search_memory(query, scope, top_k)  # type: ignore[attr-defined]

@@ -13,7 +13,19 @@ from typing import Any, Iterable, Mapping
 
 from autoweave.compiler.loader import CanonicalConfigLoader
 from autoweave.events.service import EventService
-from autoweave.models import ApprovalStatus, AttemptState, ArtifactRecord, ArtifactStatus, EventRecord, TaskAttemptRecord, TaskRecord, TaskState, generate_id
+from autoweave.models import (
+    ApprovalStatus,
+    AttemptState,
+    ArtifactRecord,
+    ArtifactStatus,
+    EventRecord,
+    MemoryEntryRecord,
+    MemoryLayer,
+    TaskAttemptRecord,
+    TaskRecord,
+    TaskState,
+    generate_id,
+)
 from autoweave.observability import LocalObservabilityService
 from autoweave.orchestration.service import OrchestrationService
 from autoweave.orchestration.state import WorkflowRunState
@@ -43,10 +55,17 @@ class LocalRuntimeDoctorReport:
     loaded_env_files: tuple[Path, ...]
     config_paths: dict[str, Path]
     vertex_worker_env: dict[str, str]
+    canonical_backend: str
+    graph_backend: str
     postgres_target: str
     neo4j_target: str
     redis_target: str
     artifact_store_path: Path
+    postgres_health: str
+    neo4j_health: str
+    redis_health: str
+    artifact_store_health: str
+    celery_health: str
     openhands_target: str
     openhands_health: OpenHandsServiceCall
     openhands_worker_timeout_seconds: int
@@ -59,10 +78,17 @@ class LocalRuntimeDoctorReport:
             f"env_files={', '.join(str(path) for path in self.loaded_env_files) or 'none'}",
             f"workflow={self.config_paths['workflow']}",
             f"vertex_credentials={self.vertex_worker_env['GOOGLE_APPLICATION_CREDENTIALS']}",
+            f"canonical_backend={self.canonical_backend}",
+            f"graph_backend={self.graph_backend}",
             f"postgres={self.postgres_target}",
+            f"postgres_health={self.postgres_health}",
             f"neo4j={self.neo4j_target}",
+            f"neo4j_health={self.neo4j_health}",
             f"redis={self.redis_target}",
+            f"redis_health={self.redis_health}",
             f"artifact_store={self.artifact_store_path}",
+            f"artifact_store_health={self.artifact_store_health}",
+            f"celery_health={self.celery_health}",
             f"openhands={self.openhands_target}",
             f"openhands_health={'ok' if self.openhands_health.ok else 'unreachable'}",
             f"openhands_worker_timeout_seconds={self.openhands_worker_timeout_seconds}",
@@ -339,6 +365,142 @@ class LocalRuntime:
         with self._runtime_lock:
             return str(self.orchestration.state.graph.workflow_run.root_input_json.get("user_request", "")).strip()
 
+    @staticmethod
+    def _truncate_text(value: str, *, max_chars: int = 600) -> str:
+        normalized = " ".join(str(value).split()).strip()
+        if len(normalized) <= max_chars:
+            return normalized
+        return normalized[: max_chars - 3].rstrip() + "..."
+
+    def _memory_scopes_for_task(self, task: TaskRecord) -> tuple[str, ...]:
+        template = self._task_template(task.task_key)
+        agent_definition = self.agent_definition(task.assigned_role)
+        seen: set[str] = set()
+        scopes: list[str] = []
+        for raw_scope in (*template.memory_scopes, *agent_definition.default_memory_scopes):
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen:
+                continue
+            scopes.append(scope)
+            seen.add(scope)
+        return tuple(scopes)
+
+    def _memory_scope_identifier(self, task: TaskRecord, scope: str) -> tuple[str, str]:
+        scope_text = str(scope).strip()
+        scope_type, separator, scope_id = scope_text.partition(":")
+        if separator and scope_id:
+            return scope_type, scope_id
+
+        with self._runtime_lock:
+            workflow_run = self.orchestration.state.graph.workflow_run
+            project_id = workflow_run.project_id
+        normalized = scope_type or "project"
+        if normalized == "project":
+            return "project", project_id
+        if normalized == "workflow_run":
+            return "workflow_run", task.workflow_run_id
+        if normalized == "task":
+            return "task", task.id
+        return normalized, task.workflow_run_id
+
+    def _memory_context(self, task: TaskRecord) -> list[dict[str, object]]:
+        context_blocks: list[dict[str, object]] = []
+        for scope in self._memory_scopes_for_task(task):
+            scope_type, scope_id = self._memory_scope_identifier(task, scope)
+            entries = self.storage.context_service.list_memory_entries(scope_type, scope_id, limit=6)
+            if not entries:
+                continue
+            entries = sorted(entries, key=lambda item: (item.created_at, item.id), reverse=True)
+            context_blocks.append(
+                {
+                    "scope": f"{scope_type}:{scope_id}",
+                    "entries": [
+                        {
+                            "memory_id": entry.id,
+                            "layer": entry.memory_layer.value,
+                            "content": self._truncate_text(entry.content, max_chars=500),
+                            "metadata": entry.metadata_json,
+                        }
+                        for entry in entries[:3]
+                    ],
+                }
+            )
+        return context_blocks
+
+    def _persist_memory_entry(
+        self,
+        *,
+        task: TaskRecord,
+        content: str,
+        memory_layer: MemoryLayer,
+        metadata_json: Mapping[str, Any] | None = None,
+        scopes: Iterable[str] | None = None,
+    ) -> tuple[str, ...]:
+        normalized = self._truncate_text(content, max_chars=1500)
+        if not normalized:
+            return ()
+
+        with self._runtime_lock:
+            project_id = self.orchestration.state.graph.workflow_run.project_id
+            repository = self.storage.workflow_repository
+
+        scope_names = tuple(scopes or self._memory_scopes_for_task(task) or ("workflow_run", "task"))
+        metadata = {
+            "task_id": task.id,
+            "task_key": task.task_key,
+            "assigned_role": task.assigned_role,
+            **dict(metadata_json or {}),
+        }
+        stored_ids: list[str] = []
+        for scope_name in scope_names:
+            scope_type, scope_id = self._memory_scope_identifier(task, scope_name)
+            entry = MemoryEntryRecord(
+                project_id=project_id,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                memory_layer=memory_layer,
+                content=normalized,
+                metadata_json=metadata,
+            )
+            if hasattr(repository, "save_memory_entry"):
+                repository.save_memory_entry(entry)
+            self.storage.memory_store.write(entry)
+            stored_ids.append(entry.id)
+        return tuple(stored_ids)
+
+    def _graph_projection_payload(
+        self,
+        *,
+        task: TaskRecord,
+        attempt: TaskAttemptRecord,
+        event_type: str,
+        payload_json: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        payload = dict(payload_json or {})
+        payload.setdefault("task_key", task.task_key)
+        payload.setdefault("task_title", task.title)
+        payload.setdefault("task_state", task.state.value)
+        payload.setdefault("attempt_state", attempt.state.value)
+        payload.setdefault("entity_id", task.id)
+        payload.setdefault("entity_type", "Task")
+        if payload.get("artifact_id"):
+            payload.setdefault("relation", "PUBLISHED_ARTIFACT")
+            payload.setdefault("target_id", str(payload["artifact_id"]))
+            payload.setdefault("target_entity_type", "Artifact")
+        elif payload.get("human_request_id"):
+            payload.setdefault("relation", "REQUESTED_HUMAN_INPUT")
+            payload.setdefault("target_id", str(payload["human_request_id"]))
+            payload.setdefault("target_entity_type", "HumanRequest")
+        elif payload.get("approval_request_id"):
+            payload.setdefault("relation", "REQUESTED_APPROVAL")
+            payload.setdefault("target_id", str(payload["approval_request_id"]))
+            payload.setdefault("target_entity_type", "ApprovalRequest")
+        elif event_type.startswith(("attempt.", "openhands.")):
+            payload.setdefault("relation", "HAS_ATTEMPT")
+            payload.setdefault("target_id", attempt.id)
+            payload.setdefault("target_entity_type", "TaskAttempt")
+        return payload
+
     def _upstream_artifact_context(self, task: TaskRecord) -> list[dict[str, object]]:
         artifacts = self.storage.context_service.get_upstream_artifacts(task_id=task.id)
         return [
@@ -368,6 +530,9 @@ class LocalRuntime:
                 merged_input["required_artifact_types"] = list(task.required_artifact_types_json)
             if task.produced_artifact_types_json:
                 merged_input["produced_artifact_types"] = list(task.produced_artifact_types_json)
+            memory_context = self._memory_context(task)
+            if memory_context:
+                merged_input["memory_context"] = memory_context
             if merged_input == task.input_json:
                 return task
             updated_task = task.model_copy(update={"input_json": merged_input})
@@ -536,6 +701,12 @@ class LocalRuntime:
         route_reason: str | None = None,
     ) -> EventRecord:
         with self._runtime_lock:
+            projected_payload = self._graph_projection_payload(
+                task=task,
+                attempt=attempt,
+                event_type=event_type,
+                payload_json=payload_json,
+            )
             event = self.event_service.publish(
                 make_event(
                     workflow_run_id=task.workflow_run_id,
@@ -547,7 +718,7 @@ class LocalRuntime:
                     route_reason=route_reason or str(attempt.compiled_worker_config_json.get("route_reason", "")),
                     event_type=event_type,
                     source=source,
-                    payload_json=payload_json or {},
+                    payload_json=projected_payload,
                     sandbox_id=attempt.workspace_id,
                 ),
                 correlation=EventCorrelationContext(
@@ -563,6 +734,22 @@ class LocalRuntime:
             )
             if hasattr(self.storage.workflow_repository, "save_event"):
                 self.storage.workflow_repository.save_event(event)
+            if hasattr(self.storage.graph_projection, "project_event"):
+                try:
+                    self.storage.graph_projection.project_event(event)
+                except Exception as exc:
+                    self.observability.record_debug_artifact(
+                        workflow_run_id=task.workflow_run_id,
+                        task_id=task.id,
+                        task_attempt_id=attempt.id,
+                        name="graph.projection_error",
+                        payload_json={
+                            "event_id": event.id,
+                            "event_type": event.event_type,
+                            "source": event.source,
+                            "error": str(exc),
+                        },
+                    )
             return event
 
     def _normalize_stream_events(
@@ -986,11 +1173,30 @@ class LocalRuntime:
             )
             if stream_event.requires_human:
                 self.orchestration.needs_input_attempt(current_attempt.id)
-                self.orchestration.request_clarification(
+                request = self.orchestration.request_clarification(
                     task_id=current_task.id,
                     task_attempt_id=current_attempt.id,
                     question=stream_event.message or "Clarification requested by worker",
                     context_summary=str(stream_event.payload_json.get("context_summary", "")),
+                )
+                self._persist_memory_entry(
+                    task=current_task,
+                    content=f"Clarification requested for {current_task.title}: {request.question}",
+                    memory_layer=MemoryLayer.EPISODIC,
+                    metadata_json={
+                        "kind": "human_request",
+                        "human_request_id": request.id,
+                    },
+                )
+                self._publish_lifecycle_event(
+                    task=current_task,
+                    attempt=current_attempt,
+                    event_type="attempt.waiting_for_human",
+                    source="orchestrator",
+                    payload_json={
+                        "human_request_id": request.id,
+                        "question": request.question,
+                    },
                 )
                 self._sync_canonical_state()
                 current_task = self.orchestration.state.task(current_task.id)
@@ -998,11 +1204,32 @@ class LocalRuntime:
                 break
             if stream_event.approval_required:
                 self.orchestration.pause_attempt(current_attempt.id)
-                self.orchestration.request_approval(
+                request = self.orchestration.request_approval(
                     task_id=current_task.id,
                     task_attempt_id=current_attempt.id,
                     approval_type=str(stream_event.payload_json.get("approval_type", "review")),
                     reason=stream_event.message or "Approval requested by worker",
+                )
+                self._persist_memory_entry(
+                    task=current_task,
+                    content=f"Approval requested for {current_task.title}: {request.reason}",
+                    memory_layer=MemoryLayer.EPISODIC,
+                    metadata_json={
+                        "kind": "approval_request",
+                        "approval_request_id": request.id,
+                        "approval_type": request.approval_type,
+                    },
+                )
+                self._publish_lifecycle_event(
+                    task=current_task,
+                    attempt=current_attempt,
+                    event_type="attempt.waiting_for_approval",
+                    source="orchestrator",
+                    payload_json={
+                        "approval_request_id": request.id,
+                        "approval_type": request.approval_type,
+                        "reason": request.reason,
+                    },
                 )
                 self._sync_canonical_state()
                 current_task = self.orchestration.state.task(current_task.id)
@@ -1013,6 +1240,17 @@ class LocalRuntime:
             if artifact is not None:
                 stored_artifact = self.storage.artifact_registry.put_artifact(artifact)
                 artifact_ids.append(stored_artifact.id)
+                if stored_artifact.status == ArtifactStatus.FINAL:
+                    self._persist_memory_entry(
+                        task=current_task,
+                        content=f"{stored_artifact.artifact_type}: {stored_artifact.summary}",
+                        memory_layer=MemoryLayer.SEMANTIC,
+                        metadata_json={
+                            "kind": "artifact",
+                            "artifact_id": stored_artifact.id,
+                            "artifact_type": stored_artifact.artifact_type,
+                        },
+                    )
                 self._publish_lifecycle_event(
                     task=current_task,
                     attempt=current_attempt,
@@ -1040,6 +1278,12 @@ class LocalRuntime:
                 )
                 self.orchestration.state.update_task(current_task)
                 current_task, current_attempt = self.orchestration.finalize_attempt_success(current_task.id, current_attempt.id)
+                self._persist_memory_entry(
+                    task=current_task,
+                    content=f"{current_task.title}: {terminal_summary}",
+                    memory_layer=MemoryLayer.SEMANTIC,
+                    metadata_json={"kind": "task_result", "outcome": "success"},
+                )
                 if not artifact_ids and current_task.produced_artifact_types_json:
                     fallback_artifact = ArtifactRecord(
                         workflow_run_id=current_task.workflow_run_id,
@@ -1084,6 +1328,12 @@ class LocalRuntime:
                     reason=stream_event.message or outcome or "worker_recovery",
                     recoverable=True,
                 )
+                self._persist_memory_entry(
+                    task=current_task,
+                    content=f"{current_task.title} stalled: {stream_event.message or outcome or 'worker_recovery'}",
+                    memory_layer=MemoryLayer.EPISODIC,
+                    metadata_json={"kind": "task_result", "outcome": outcome or "timeout"},
+                )
                 self._sync_canonical_state()
             elif outcome in {"failure", "failed", "error"}:
                 recoverable_failure = stream_event.payload_json.get("diagnostic_code") == "worker_empty_response_loop"
@@ -1092,6 +1342,16 @@ class LocalRuntime:
                     current_attempt.id,
                     reason=stream_event.message or outcome or "worker_failure",
                     recoverable=recoverable_failure,
+                )
+                self._persist_memory_entry(
+                    task=current_task,
+                    content=f"{current_task.title} failed: {stream_event.message or outcome or 'worker_failure'}",
+                    memory_layer=MemoryLayer.EPISODIC,
+                    metadata_json={
+                        "kind": "task_result",
+                        "outcome": outcome or "error",
+                        "recoverable": recoverable_failure,
+                    },
                 )
                 self._sync_canonical_state()
             elif stream_event.event_type == "progress":
@@ -1187,18 +1447,33 @@ class LocalRuntime:
                 agent_definition=agent_definition,
             )
             with self._runtime_lock:
-                self.orchestration.request_approval(
+                request = self.orchestration.request_approval(
                     task_id=task.id,
                     task_attempt_id=attempt.id,
                     approval_type=approval_requirements[0] if approval_requirements else "operator_confirmation",
                     reason=approval_reason,
                 )
+            self._persist_memory_entry(
+                task=task,
+                content=f"Approval requested for {task.title}: {request.reason}",
+                memory_layer=MemoryLayer.EPISODIC,
+                metadata_json={
+                    "kind": "approval_request",
+                    "approval_request_id": request.id,
+                    "approval_type": request.approval_type,
+                },
+            )
             self._publish_lifecycle_event(
                 task=task,
                 attempt=attempt,
                 event_type="attempt.waiting_for_approval",
                 source="orchestrator",
-                payload_json={"reason": approval_reason, "approval_requirements": approval_requirements},
+                payload_json={
+                    "approval_request_id": request.id,
+                    "approval_type": request.approval_type,
+                    "reason": approval_reason,
+                    "approval_requirements": approval_requirements,
+                },
                 route_model_name=route.model_name,
                 route_reason=route.route_reason,
             )
@@ -1404,6 +1679,84 @@ class LocalRuntime:
             failure_reason=failure_reason,
         )
 
+    def _probe_postgres_health(self) -> str:
+        if not self.settings.postgres_url.strip():
+            return "disabled (POSTGRES_URL not configured)"
+        try:
+            import psycopg
+
+            schema = self.settings.autoweave_postgres_schema
+            with psycopg.connect(self.settings.postgres_url, autocommit=True, connect_timeout=5) as conn:
+                database = str(conn.execute("SELECT current_database()").fetchone()[0])
+                table_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM information_schema.tables
+                        WHERE table_schema = %s
+                        """,
+                        (schema,),
+                    ).fetchone()[0]
+                )
+            mode = "active" if self.settings.autoweave_canonical_backend == "postgres" else "reachable"
+            return f"ok ({mode}; database={database}; schema={schema}; tables={table_count})"
+        except Exception as exc:
+            return f"error ({exc})"
+
+    def _probe_neo4j_health(self) -> str:
+        if not self.settings.neo4j_url.strip():
+            return "disabled (NEO4J_URL not configured)"
+        try:
+            from neo4j import GraphDatabase
+
+            auth = None
+            if self.settings.neo4j_username or self.settings.neo4j_password:
+                auth = (self.settings.neo4j_username, self.settings.neo4j_password)
+            driver = GraphDatabase.driver(self.settings.neo4j_url, auth=auth, connection_timeout=5.0)
+            try:
+                driver.verify_connectivity()
+            finally:
+                driver.close()
+            mode = "active" if self.settings.autoweave_graph_backend == "neo4j" else "reachable"
+            return f"ok ({mode}; host={self.settings.neo4j_target().host})"
+        except Exception as exc:
+            return f"error ({exc})"
+
+    def _probe_redis_health(self) -> str:
+        try:
+            from autoweave.storage.coordination import RedisClient
+
+            return "ok" if RedisClient(self.settings.redis_url).ping() else "error (ping returned false)"
+        except Exception as exc:
+            return f"error ({exc})"
+
+    def _probe_artifact_store_health(self) -> str:
+        artifact_root = self.settings.artifact_store_path()
+        probe_path = artifact_root / ".autoweave-healthcheck"
+        payload = json.dumps({"probe": "artifact_store", "timestamp": time.time()}, sort_keys=True)
+        try:
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            probe_path.write_text(payload, encoding="utf-8")
+            echoed = probe_path.read_text(encoding="utf-8")
+            if echoed != payload:
+                return "error (write/read mismatch)"
+            return f"ok (root={artifact_root})"
+        except Exception as exc:
+            return f"error ({exc})"
+        finally:
+            if probe_path.exists():
+                probe_path.unlink()
+
+    def _probe_celery_health(self) -> str:
+        queue_names = tuple(self.runtime_config.celery_queue_names)
+        if not queue_names:
+            return "disabled (no celery queues configured)"
+        return (
+            "scaffold_only (queues declared: "
+            + ", ".join(queue_names)
+            + "; packaged runtime has no Celery worker binding yet)"
+        )
+
     def doctor(self) -> LocalRuntimeDoctorReport:
         ready_task_keys = tuple(
             self.orchestration.state.task(task_id).task_key
@@ -1420,10 +1773,17 @@ class LocalRuntime:
                 "observability": self.settings.resolve_config_path(self.settings.autoweave_observability_config),
             },
             vertex_worker_env=self.settings.worker_environment(),
+            canonical_backend=self.settings.autoweave_canonical_backend,
+            graph_backend=self.settings.autoweave_graph_backend,
             postgres_target=json.dumps(self.settings.postgres_target().redacted_dump(), sort_keys=True),
             neo4j_target=json.dumps(self.settings.neo4j_target().redacted_dump(), sort_keys=True),
             redis_target=json.dumps(self.settings.redis_target().redacted_dump(), sort_keys=True),
             artifact_store_path=self.settings.artifact_store_path(),
+            postgres_health=self._probe_postgres_health(),
+            neo4j_health=self._probe_neo4j_health(),
+            redis_health=self._probe_redis_health(),
+            artifact_store_health=self._probe_artifact_store_health(),
+            celery_health=self._probe_celery_health(),
             openhands_target=self.settings.openhands_target().base_url,
             openhands_health=self.openhands_client.health_probe(),
             openhands_worker_timeout_seconds=self.settings.openhands_worker_timeout_seconds,
@@ -1571,6 +1931,16 @@ class LocalRuntime:
         updated_input["human_answers"] = human_answers
         self.orchestration.state.update_task(task.model_copy(update={"input_json": updated_input}))
         self.orchestration.answer_human_request(request_id, answer_text=answer_text, answered_by=answered_by)
+        self._persist_memory_entry(
+            task=task,
+            content=f"Human answer for {task.title}: {request.question} Answer: {answer_text}",
+            memory_layer=MemoryLayer.SEMANTIC,
+            metadata_json={
+                "kind": "human_answer",
+                "human_request_id": request.id,
+                "answered_by": answered_by,
+            },
+        )
         self._sync_canonical_state()
         return self._advance_current_workflow(
             request=self._workflow_request(),
@@ -1623,6 +1993,19 @@ class LocalRuntime:
         if active_attempt is not None:
             self.orchestration.abort_attempt(active_attempt.id)
         self.orchestration.resolve_approval(request_id, approved=approved, resolved_by=resolved_by)
+        decision = "approved" if approved else "rejected"
+        self._persist_memory_entry(
+            task=task,
+            content=f"Approval {decision} for {task.title}: {request.reason}",
+            memory_layer=MemoryLayer.SEMANTIC,
+            metadata_json={
+                "kind": "approval_resolution",
+                "approval_request_id": request.id,
+                "approval_type": request.approval_type,
+                "resolved_by": resolved_by,
+                "approved": approved,
+            },
+        )
         self._sync_canonical_state()
         return self._advance_current_workflow(
             request=self._workflow_request(),
