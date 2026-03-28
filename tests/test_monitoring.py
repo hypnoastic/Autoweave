@@ -477,6 +477,28 @@ def test_monitoring_service_snapshot_returns_loading_until_background_refresh_fi
     assert payload["runs"][0]["id"] == "run_demo_1"
 
 
+def test_monitoring_service_snapshot_can_block_for_fresh_state(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+
+    class _SlowRuntime:
+        def __enter__(self):
+            time.sleep(0.3)
+            self._runtime = _FakeRuntime(tmp_path)
+            return self._runtime
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+    service = MonitoringService(root=tmp_path, runtime_factory=lambda **kwargs: _SlowRuntime())
+
+    payload = service.snapshot(limit=3, wait_for_refresh=True)
+
+    assert payload["status"] == "ok"
+    assert payload["refreshing"] is False
+    assert payload["selected_run_id"] == "run_demo_1"
+    assert payload["runs"][0]["id"] == "run_demo_1"
+
+
 def test_monitoring_service_snapshot_skips_runtime_for_clean_sqlite_state(tmp_path: Path) -> None:
     bootstrap_repository(tmp_path)
 

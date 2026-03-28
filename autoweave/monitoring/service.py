@@ -199,7 +199,19 @@ class MonitoringService:
             )
         return agents
 
-    def snapshot(self, *, limit: int = 5) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        limit: int = 5,
+        wait_for_refresh: bool = False,
+    ) -> dict[str, Any]:
+        if wait_for_refresh:
+            payload = self._compute_snapshot(limit=limit)
+            with self._lock:
+                self._snapshot_cache = copy.deepcopy(payload)
+                self._snapshot_refreshing = False
+            payload["refreshing"] = False
+            return payload
         refresh_thread = self._ensure_snapshot_refresh(limit=limit)
         if refresh_thread is not None:
             refresh_thread.join(timeout=0.25)
