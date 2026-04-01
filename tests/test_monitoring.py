@@ -499,6 +499,23 @@ def test_monitoring_service_snapshot_can_block_for_fresh_state(tmp_path: Path) -
     assert payload["runs"][0]["id"] == "run_demo_1"
 
 
+def test_monitoring_service_snapshot_caches_job_views_per_request_shape(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+    service = MonitoringService(root=tmp_path, runtime_factory=lambda **kwargs: _FakeRuntime(tmp_path))
+
+    service.launch_workflow(request="Ship checkout", dispatch=False, max_steps=2)
+
+    without_jobs = service.snapshot(limit=3, include_jobs=False, wait_for_refresh=True)
+    with_jobs = service.snapshot(limit=3, include_jobs=True, wait_for_refresh=True)
+    without_jobs_cached = service.snapshot(limit=3, include_jobs=False)
+    with_jobs_cached = service.snapshot(limit=3, include_jobs=True)
+
+    assert without_jobs["jobs"] == []
+    assert without_jobs_cached["jobs"] == []
+    assert len(with_jobs["jobs"]) == 1
+    assert len(with_jobs_cached["jobs"]) == 1
+
+
 def test_monitoring_service_snapshot_skips_runtime_for_clean_sqlite_state(tmp_path: Path) -> None:
     bootstrap_repository(tmp_path)
 

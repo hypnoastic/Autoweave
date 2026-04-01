@@ -118,8 +118,8 @@ class MonitoringService:
         )
         self._jobs: dict[str, MonitoringJob] = {}
         self._lock = Lock()
-        self._snapshot_cache: dict[str, Any] | None = None
-        self._snapshot_refreshing = False
+        self._snapshot_cache: dict[tuple[int, bool], dict[str, Any]] = {}
+        self._snapshot_refreshing: set[tuple[int, bool]] = set()
 
     def _runtime(self, *, workflow_run_id: str | None = None):
         kwargs: dict[str, Any] = {
@@ -204,24 +204,26 @@ class MonitoringService:
         *,
         limit: int = 5,
         wait_for_refresh: bool = False,
+        include_jobs: bool = True,
     ) -> dict[str, Any]:
+        request_key = self._snapshot_request_key(limit=limit, include_jobs=include_jobs)
         if wait_for_refresh:
-            payload = self._compute_snapshot(limit=limit)
+            payload = self._compute_snapshot(limit=limit, include_jobs=include_jobs)
             with self._lock:
-                self._snapshot_cache = copy.deepcopy(payload)
-                self._snapshot_refreshing = False
+                self._snapshot_cache[request_key] = copy.deepcopy(payload)
+                self._snapshot_refreshing.discard(request_key)
             payload["refreshing"] = False
             return payload
-        refresh_thread = self._ensure_snapshot_refresh(limit=limit)
+        refresh_thread = self._ensure_snapshot_refresh(limit=limit, include_jobs=include_jobs)
         if refresh_thread is not None:
             refresh_thread.join(timeout=0.25)
         with self._lock:
-            cached = copy.deepcopy(self._snapshot_cache)
-            refreshing = self._snapshot_refreshing
+            cached = copy.deepcopy(self._snapshot_cache.get(request_key))
+            refreshing = request_key in self._snapshot_refreshing
         if cached is not None:
             cached["refreshing"] = refreshing
             return cached
-        base_payload = self._snapshot_base_payload()
+        base_payload = self._snapshot_base_payload(include_jobs=include_jobs)
         base_payload.update(
             {
                 "status": "loading",
@@ -231,37 +233,42 @@ class MonitoringService:
         )
         return base_payload
 
-    def _ensure_snapshot_refresh(self, *, limit: int) -> Thread | None:
+    def _snapshot_request_key(self, *, limit: int, include_jobs: bool) -> tuple[int, bool]:
+        return (limit, include_jobs)
+
+    def _ensure_snapshot_refresh(self, *, limit: int, include_jobs: bool) -> Thread | None:
+        request_key = self._snapshot_request_key(limit=limit, include_jobs=include_jobs)
         with self._lock:
-            if self._snapshot_refreshing:
+            if request_key in self._snapshot_refreshing:
                 return None
-            self._snapshot_refreshing = True
-        thread = Thread(target=self._refresh_snapshot, kwargs={"limit": limit}, daemon=True)
+            self._snapshot_refreshing.add(request_key)
+        thread = Thread(target=self._refresh_snapshot, kwargs={"limit": limit, "include_jobs": include_jobs}, daemon=True)
         thread.start()
         return thread
 
-    def _refresh_snapshot(self, *, limit: int) -> None:
-        payload = self._compute_snapshot(limit=limit)
+    def _refresh_snapshot(self, *, limit: int, include_jobs: bool) -> None:
+        request_key = self._snapshot_request_key(limit=limit, include_jobs=include_jobs)
+        payload = self._compute_snapshot(limit=limit, include_jobs=include_jobs)
         with self._lock:
-            self._snapshot_cache = payload
-            self._snapshot_refreshing = False
+            self._snapshot_cache[request_key] = payload
+            self._snapshot_refreshing.discard(request_key)
 
-    def _snapshot_base_payload(self) -> dict[str, Any]:
+    def _snapshot_base_payload(self, *, include_jobs: bool) -> dict[str, Any]:
         base_payload = {
             "status": "ok",
             "load_error": None,
             "project_root": str(self.root),
             "agents": [],
             "workflow_blueprint": {"name": None, "version": None, "entrypoint": None, "roles": [], "templates": []},
-            "jobs": self.jobs(),
+            "jobs": self.jobs() if include_jobs else [],
             "runs": [],
             "selected_run_id": None,
             "selected_run": None,
         }
         return base_payload
 
-    def _compute_snapshot(self, *, limit: int = 5) -> dict[str, Any]:
-        base_payload = self._snapshot_base_payload()
+    def _compute_snapshot(self, *, limit: int = 5, include_jobs: bool = True) -> dict[str, Any]:
+        base_payload = self._snapshot_base_payload(include_jobs=include_jobs)
         base_errors: list[str] = []
         settings = LocalEnvironmentSettings.load(root=self.root, environ=self.environ)
         runtime_payload: dict[str, Any] = {
