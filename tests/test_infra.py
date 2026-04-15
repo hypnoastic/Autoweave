@@ -71,6 +71,27 @@ def test_docker_assets_exist_for_runtime_container() -> None:
     assert "config/secrets/" in Path(".dockerignore").read_text(encoding="utf-8")
 
 
+def test_repo_contains_library_ci_workflow() -> None:
+    workflow_path = Path(".github/workflows/library-ci.yml")
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+
+    assert workflow_path.exists()
+    assert workflow["name"] == "Library CI"
+    assert set(workflow["jobs"]) == {"test", "build-wheel"}
+    assert workflow["jobs"]["test"]["strategy"]["matrix"]["python-version"] == ["3.10", "3.11"]
+    assert workflow["jobs"]["test"]["steps"][-1]["run"] == "python -m pytest tests -q"
+    assert workflow["jobs"]["build-wheel"]["steps"][-1]["run"] == "python -m build --wheel --no-isolation"
+
+
+def test_repo_contains_commit_push_guidelines() -> None:
+    guideline_path = Path("docs/commit_push_guidelines.md")
+    text = guideline_path.read_text(encoding="utf-8")
+
+    assert guideline_path.exists()
+    assert "Commit and push after each green vertical slice." in text
+    assert "feat(runtime): ..." in text
+
+
 def test_compose_matches_settings_expectations() -> None:
     settings = LocalEnvironmentSettings.load(root=Path("."), materialize_vertex_credentials=False)
 
