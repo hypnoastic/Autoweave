@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 
 from apps.cli.bootstrap import bootstrap_repository
+from autoweave.exceptions import RuntimeErrorCode
 from autoweave.local_runtime import LocalWorkflowRunReport
 from autoweave.models import ArtifactRecord, ArtifactStatus, AttemptState, EventRecord, HumanRequestRecord, HumanRequestStatus, HumanRequestType, TaskAttemptRecord, TaskRecord, TaskState, WorkflowRunRecord, WorkflowRunStatus
 from autoweave.monitoring.service import MonitoringService
@@ -325,6 +326,8 @@ def test_monitoring_service_snapshot_exposes_canonical_state(tmp_path: Path) -> 
     assert payload["runs"][0]["human_requests"][0]["question"] == "Which payment providers should be enabled?"
     assert payload["runs"][0]["task_state_counts"]["waiting_for_human"] == 1
     assert payload["runs"][0]["attempt_state_counts"]["queued"] == 1
+    assert payload["load_failures"] == []
+    assert payload["degraded_reasons"] == []
 
 
 def test_monitoring_service_launches_background_workflow_job(tmp_path: Path) -> None:
@@ -342,6 +345,7 @@ def test_monitoring_service_launches_background_workflow_job(tmp_path: Path) -> 
     assert current["status"] == "completed"
     assert current["workflow_run_id"] == "run_demo_2"
     assert "workflow_run_id=run_demo_2" in "\n".join(current["summary_lines"])
+    assert current["failure"] is None
 
 
 def test_monitoring_service_can_enqueue_celery_backed_workflow_job(tmp_path: Path, monkeypatch) -> None:
@@ -441,6 +445,8 @@ def test_monitoring_service_snapshot_degrades_but_preserves_catalog(tmp_path: Pa
     assert payload["agents"][0]["role"] == "backend"
     assert payload["workflow_blueprint"]["entrypoint"] == "manager_plan"
     assert payload["runs"] == []
+    assert payload["load_failures"][-1]["code"] == RuntimeErrorCode.RUNTIME_UNAVAILABLE.value
+    assert payload["degraded_reasons"][-1] == RuntimeErrorCode.RUNTIME_UNAVAILABLE.value
 
 
 def test_monitoring_service_snapshot_returns_loading_until_background_refresh_finishes(tmp_path: Path) -> None:
@@ -466,6 +472,7 @@ def test_monitoring_service_snapshot_returns_loading_until_background_refresh_fi
     assert payload["refreshing"] is True
     assert payload["agents"] == []
     assert payload["runs"] == []
+    assert payload["load_failures"] == []
 
     for _ in range(50):
         payload = service.snapshot(limit=3)
@@ -532,6 +539,7 @@ def test_monitoring_service_snapshot_skips_runtime_for_clean_sqlite_state(tmp_pa
     assert payload["agents"][0]["role"] == "backend"
     assert payload["workflow_blueprint"]["entrypoint"] == "manager_plan"
     assert payload["runs"] == []
+    assert payload["load_failures"] == []
 
 
 def test_monitoring_dashboard_wsgi_app_routes_chat_and_approval_actions(tmp_path: Path) -> None:
@@ -598,6 +606,32 @@ def test_monitoring_dashboard_wsgi_app_routes_chat_and_approval_actions(tmp_path
             "max_steps": 1,
         },
     ) in recorder
+
+
+def test_monitoring_service_records_typed_job_failures(tmp_path: Path) -> None:
+    bootstrap_repository(tmp_path)
+
+    class _FailingRuntime(_FakeRuntime):
+        def run_workflow(self, *, request: str, dispatch: bool, max_steps: int) -> LocalWorkflowRunReport:
+            raise RuntimeError("worker bootstrap failed")
+
+    service = MonitoringService(root=tmp_path, runtime_factory=lambda **kwargs: _FailingRuntime(tmp_path))
+
+    job = service.launch_workflow(request="Break the run", dispatch=False, max_steps=2)
+
+    current = job
+    for _ in range(50):
+        jobs = service.jobs()
+        current = next(item for item in jobs if item["id"] == job["id"])
+        if current["status"] != "running":
+            break
+        time.sleep(0.01)
+
+    assert current["status"] == "error"
+    assert current["error"] == "RuntimeError: worker bootstrap failed"
+    assert current["failure"]["code"] == RuntimeErrorCode.JOB_EXECUTION_FAILED.value
+    assert current["failure"]["recoverable"] is True
+    assert current["failure"]["details_json"]["action"] == "start"
 
 
 def test_monitoring_service_marks_blocked_runs_and_separates_manager_failure(tmp_path: Path) -> None:

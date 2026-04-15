@@ -13,8 +13,10 @@ import yaml
 
 from autoweave.celery_queue import CeleryTaskSnapshot, CeleryWorkflowDispatcher, celery_execution_enabled
 from autoweave.compiler.loader import CanonicalConfigLoader
+from autoweave.exceptions import ConfigurationError, RuntimeErrorCode, RuntimeFailure, RuntimeOperationError
 from autoweave.local_runtime import LocalWorkflowRunReport, build_local_runtime
 from autoweave.models import ArtifactRecord, ApprovalRequestRecord, EventRecord, HumanRequestRecord, TaskAttemptRecord, TaskRecord, WorkflowRunRecord, generate_id
+from autoweave.monitoring.contracts import MonitoringActionReceipt, MonitoringJobStatus, MonitoringSnapshot, MonitoringSnapshotStatus
 from autoweave.settings import LocalEnvironmentSettings
 
 _ACTIVE_WORKER_ATTEMPT_STATES = {"dispatching", "running", "paused", "needs_input"}
@@ -46,6 +48,34 @@ def _short_json(value: object, *, max_length: int = 360) -> str:
     return f"{text[: max_length - 3]}..."
 
 
+def _format_exception_message(exc: BaseException) -> str:
+    return "".join(traceback.format_exception_only(type(exc), exc)).strip()
+
+
+def _runtime_failure(
+    exc: BaseException,
+    *,
+    code: RuntimeErrorCode,
+    recoverable: bool = False,
+    details_json: Mapping[str, Any] | None = None,
+) -> RuntimeFailure:
+    if isinstance(exc, RuntimeOperationError):
+        return exc.failure
+    if isinstance(exc, ConfigurationError):
+        return RuntimeFailure(
+            code=RuntimeErrorCode.CONFIGURATION_INVALID,
+            message=_format_exception_message(exc),
+            recoverable=False,
+            details_json=dict(details_json or {}),
+        )
+    return RuntimeFailure(
+        code=code,
+        message=_format_exception_message(exc),
+        recoverable=recoverable,
+        details_json=dict(details_json or {}),
+    )
+
+
 @dataclass(slots=True)
 class MonitoringJob:
     id: str
@@ -63,28 +93,15 @@ class MonitoringJob:
     queue: str | None = None
     report_payload: dict[str, Any] | None = None
     error: str | None = None
+    failure: RuntimeFailure | None = None
     report: LocalWorkflowRunReport | None = None
 
     def to_payload(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "id": self.id,
-            "action": self.action,
-            "request": self.request,
-            "dispatch": self.dispatch,
-            "max_steps": self.max_steps,
-            "status": self.status,
-            "workflow_run_id": self.workflow_run_id,
-            "human_request_id": self.human_request_id,
-            "approval_request_id": self.approval_request_id,
-            "approved": self.approved,
-            "celery_task_id": self.celery_task_id,
-            "queue_backend": self.queue_backend,
-            "queue": self.queue,
-            "error": self.error,
-        }
+        summary_lines: tuple[str, ...] = ()
+        step_reports: tuple[dict[str, Any], ...] = ()
         if self.report is not None:
-            payload["summary_lines"] = self.report.summary_lines()
-            payload["step_reports"] = [
+            summary_lines = tuple(self.report.summary_lines())
+            step_reports = tuple(
                 {
                     "task_key": step.task_key,
                     "task_state": step.task_state,
@@ -93,11 +110,30 @@ class MonitoringJob:
                     "failure_reason": step.failure_reason,
                 }
                 for step in self.report.step_reports
-            ]
+            )
         elif self.report_payload is not None:
-            payload["summary_lines"] = list(self.report_payload.get("summary_lines", []))
-            payload["step_reports"] = list(self.report_payload.get("step_reports", []))
-        return payload
+            summary_lines = tuple(str(line) for line in self.report_payload.get("summary_lines", ()))
+            step_reports = tuple(dict(step) for step in self.report_payload.get("step_reports", ()) if isinstance(step, Mapping))
+        receipt = MonitoringActionReceipt(
+            id=self.id,
+            action=self.action,
+            request=self.request,
+            dispatch=self.dispatch,
+            max_steps=self.max_steps,
+            status=self.status,
+            workflow_run_id=self.workflow_run_id,
+            human_request_id=self.human_request_id,
+            approval_request_id=self.approval_request_id,
+            approved=self.approved,
+            celery_task_id=self.celery_task_id,
+            queue_backend=self.queue_backend,
+            queue=self.queue,
+            error=self.error,
+            failure=self.failure,
+            summary_lines=summary_lines,
+            step_reports=step_reports,
+        )
+        return receipt.to_payload()
 
 
 class MonitoringService:
@@ -212,8 +248,9 @@ class MonitoringService:
             with self._lock:
                 self._snapshot_cache[request_key] = copy.deepcopy(payload)
                 self._snapshot_refreshing.discard(request_key)
-            payload["refreshing"] = False
-            return payload
+            refreshed = dict(payload)
+            refreshed["refreshing"] = False
+            return refreshed
         refresh_thread = self._ensure_snapshot_refresh(limit=limit, include_jobs=include_jobs)
         if refresh_thread is not None:
             refresh_thread.join(timeout=0.25)
@@ -223,15 +260,55 @@ class MonitoringService:
         if cached is not None:
             cached["refreshing"] = refreshing
             return cached
-        base_payload = self._snapshot_base_payload(include_jobs=include_jobs)
-        base_payload.update(
-            {
-                "status": "loading",
-                "load_error": "Loading live workflow state…",
-                "refreshing": refreshing,
-            }
-        )
-        return base_payload
+        return MonitoringSnapshot(
+            project_root=str(self.root),
+            jobs=self.jobs() if include_jobs else [],
+            status=MonitoringSnapshotStatus.LOADING,
+            load_error="Loading live workflow state…",
+            refreshing=refreshing,
+        ).to_payload()
+
+    def _build_snapshot_payload(
+        self,
+        *,
+        project_root: str,
+        agents: list[dict[str, Any]],
+        workflow_blueprint: dict[str, Any],
+        jobs: list[dict[str, Any]],
+        runs: list[dict[str, Any]],
+        selected_run_id: str | None,
+        selected_run: dict[str, Any] | None,
+        status: MonitoringSnapshotStatus,
+        load_failures: Iterable[RuntimeFailure] = (),
+        load_error: str | None = None,
+        refreshing: bool = False,
+        stale: bool = False,
+    ) -> dict[str, Any]:
+        return MonitoringSnapshot(
+            project_root=project_root,
+            agents=agents,
+            workflow_blueprint=workflow_blueprint,
+            jobs=jobs,
+            runs=runs,
+            selected_run_id=selected_run_id,
+            selected_run=selected_run,
+            status=status,
+            load_error=load_error,
+            load_failures=tuple(load_failures),
+            refreshing=refreshing,
+            stale=stale,
+        ).to_payload()
+
+    def _snapshot_defaults(self, *, include_jobs: bool) -> dict[str, Any]:
+        return {
+            "project_root": str(self.root),
+            "agents": [],
+            "workflow_blueprint": {"name": None, "version": None, "entrypoint": None, "roles": [], "templates": []},
+            "jobs": self.jobs() if include_jobs else [],
+            "runs": [],
+            "selected_run_id": None,
+            "selected_run": None,
+        }
 
     def _snapshot_request_key(self, *, limit: int, include_jobs: bool) -> tuple[int, bool]:
         return (limit, include_jobs)
@@ -253,23 +330,9 @@ class MonitoringService:
             self._snapshot_cache[request_key] = payload
             self._snapshot_refreshing.discard(request_key)
 
-    def _snapshot_base_payload(self, *, include_jobs: bool) -> dict[str, Any]:
-        base_payload = {
-            "status": "ok",
-            "load_error": None,
-            "project_root": str(self.root),
-            "agents": [],
-            "workflow_blueprint": {"name": None, "version": None, "entrypoint": None, "roles": [], "templates": []},
-            "jobs": self.jobs() if include_jobs else [],
-            "runs": [],
-            "selected_run_id": None,
-            "selected_run": None,
-        }
-        return base_payload
-
     def _compute_snapshot(self, *, limit: int = 5, include_jobs: bool = True) -> dict[str, Any]:
-        base_payload = self._snapshot_base_payload(include_jobs=include_jobs)
-        base_errors: list[str] = []
+        snapshot_defaults = self._snapshot_defaults(include_jobs=include_jobs)
+        base_failures: list[RuntimeFailure] = []
         settings = LocalEnvironmentSettings.load(root=self.root, environ=self.environ)
         runtime_payload: dict[str, Any] = {
             "project_root": str(settings.project_root),
@@ -278,13 +341,27 @@ class MonitoringService:
             "selected_run": None,
         }
         try:
-            base_payload["agents"] = self.agent_catalog()
+            snapshot_defaults["agents"] = self.agent_catalog()
         except Exception as exc:
-            base_errors.append(f"agent catalog unavailable: {exc}")
+            base_failures.append(
+                _runtime_failure(
+                    exc,
+                    code=RuntimeErrorCode.AGENT_CATALOG_UNAVAILABLE,
+                    recoverable=True,
+                    details_json={"phase": "agent_catalog"},
+                )
+            )
         try:
-            base_payload["workflow_blueprint"] = self.workflow_blueprint()
+            snapshot_defaults["workflow_blueprint"] = self.workflow_blueprint()
         except Exception as exc:
-            base_errors.append(f"workflow blueprint unavailable: {exc}")
+            base_failures.append(
+                _runtime_failure(
+                    exc,
+                    code=RuntimeErrorCode.WORKFLOW_BLUEPRINT_UNAVAILABLE,
+                    recoverable=True,
+                    details_json={"phase": "workflow_blueprint"},
+                )
+            )
         if (
             self._can_short_circuit_clean_sqlite
             and self.root == settings.project_root
@@ -292,12 +369,17 @@ class MonitoringService:
             settings.autoweave_canonical_backend == "sqlite"
             and not (settings.state_dir() / "autoweave.sqlite3").exists()
         ):
-            return {
-                **base_payload,
-                **runtime_payload,
-                "status": "degraded" if base_errors else "ok",
-                "load_error": "\n".join(base_errors) or None,
-            }
+            return self._build_snapshot_payload(
+                project_root=str(runtime_payload["project_root"]),
+                agents=list(snapshot_defaults["agents"]),
+                workflow_blueprint=dict(snapshot_defaults["workflow_blueprint"]),
+                jobs=list(snapshot_defaults["jobs"]),
+                runs=[],
+                selected_run_id=None,
+                selected_run=None,
+                status=MonitoringSnapshotStatus.DEGRADED if base_failures else MonitoringSnapshotStatus.OK,
+                load_failures=base_failures,
+            )
         try:
             with self._runtime() as runtime:
                 repository = runtime.storage.workflow_repository
@@ -326,19 +408,37 @@ class MonitoringService:
                     }
                 )
         except Exception as exc:
-            combined_errors = [*base_errors, "".join(traceback.format_exception_only(type(exc), exc)).strip()]
-            return {
-                **base_payload,
-                **runtime_payload,
-                "status": "degraded",
-                "load_error": "\n".join(item for item in combined_errors if item),
-            }
-        return {
-            **base_payload,
-            **runtime_payload,
-            "status": "degraded" if base_errors else "ok",
-            "load_error": "\n".join(base_errors) or None,
-        }
+            combined_failures = [
+                *base_failures,
+                _runtime_failure(
+                    exc,
+                    code=RuntimeErrorCode.RUNTIME_UNAVAILABLE,
+                    recoverable=True,
+                    details_json={"phase": "snapshot_runtime"},
+                ),
+            ]
+            return self._build_snapshot_payload(
+                project_root=str(runtime_payload["project_root"]),
+                agents=list(snapshot_defaults["agents"]),
+                workflow_blueprint=dict(snapshot_defaults["workflow_blueprint"]),
+                jobs=list(snapshot_defaults["jobs"]),
+                runs=list(runtime_payload["runs"]),
+                selected_run_id=runtime_payload["selected_run_id"],
+                selected_run=runtime_payload["selected_run"],
+                status=MonitoringSnapshotStatus.DEGRADED,
+                load_failures=combined_failures,
+            )
+        return self._build_snapshot_payload(
+            project_root=str(runtime_payload["project_root"]),
+            agents=list(snapshot_defaults["agents"]),
+            workflow_blueprint=dict(snapshot_defaults["workflow_blueprint"]),
+            jobs=list(snapshot_defaults["jobs"]),
+            runs=list(runtime_payload["runs"]),
+            selected_run_id=runtime_payload["selected_run_id"],
+            selected_run=runtime_payload["selected_run"],
+            status=MonitoringSnapshotStatus.DEGRADED if base_failures else MonitoringSnapshotStatus.OK,
+            load_failures=base_failures,
+        )
 
     def jobs(self) -> list[dict[str, Any]]:
         self._refresh_queue_jobs()
@@ -507,7 +607,11 @@ class MonitoringService:
                         max_steps=max_steps,
                     )
                 else:  # pragma: no cover - defensive guard
-                    raise ValueError(f"unknown monitoring action {action!r}")
+                    raise RuntimeOperationError(
+                        code=RuntimeErrorCode.INVALID_ACTION,
+                        message=f"unknown monitoring action {action!r}",
+                        details_json={"action": action},
+                    )
             with self._lock:
                 job = self._jobs[job_id]
                 job.report = report
@@ -523,8 +627,19 @@ class MonitoringService:
         except Exception as exc:  # pragma: no cover - defensive live-path protection
             with self._lock:
                 job = self._jobs[job_id]
-                job.status = "error"
-                job.error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                job.status = MonitoringJobStatus.ERROR.value
+                job.failure = _runtime_failure(
+                    exc,
+                    code=RuntimeErrorCode.JOB_EXECUTION_FAILED,
+                    recoverable=True,
+                    details_json={
+                        "action": action,
+                        "workflow_run_id": workflow_run_id,
+                        "human_request_id": human_request_id,
+                        "approval_request_id": approval_request_id,
+                    },
+                )
+                job.error = job.failure.message
 
     def _refresh_queue_jobs(self) -> None:
         dispatcher = self._queue_dispatcher()
@@ -547,15 +662,21 @@ class MonitoringService:
                 job.report_payload = snapshot.report_payload
             if snapshot.error:
                 job.error = snapshot.error
+                job.failure = RuntimeFailure(
+                    code=RuntimeErrorCode.JOB_EXECUTION_FAILED,
+                    message=snapshot.error,
+                    recoverable=True,
+                    details_json={"backend": "celery", "task_id": snapshot.task_id},
+                )
             state = snapshot.state.upper()
             if state in {"PENDING", "RECEIVED", "RETRY"}:
-                job.status = "queued"
+                job.status = MonitoringJobStatus.QUEUED.value
                 return
             if state == "STARTED":
-                job.status = "running"
+                job.status = MonitoringJobStatus.RUNNING.value
                 return
             if state == "FAILURE":
-                job.status = "failed"
+                job.status = MonitoringJobStatus.FAILED.value
                 return
             if state != "SUCCESS":
                 job.status = state.lower()
@@ -566,13 +687,13 @@ class MonitoringService:
             open_approval = tuple(report_payload.get("open_approval_reasons", ()))
             workflow_status = str(report_payload.get("workflow_status", "running"))
             if open_human:
-                job.status = "waiting_for_human"
+                job.status = MonitoringJobStatus.WAITING_FOR_HUMAN.value
             elif open_approval:
-                job.status = "waiting_for_approval"
+                job.status = MonitoringJobStatus.WAITING_FOR_APPROVAL.value
             elif workflow_status == "failed":
-                job.status = "failed"
+                job.status = MonitoringJobStatus.FAILED.value
             else:
-                job.status = "completed"
+                job.status = MonitoringJobStatus.COMPLETED.value
 
     def _run_payload(
         self,
